@@ -1,18 +1,21 @@
 import ccxt
 import pandas as pd
+import json
+import os
 import logging
 from datetime import datetime
 
 log = logging.getLogger(__name__)
 
 # ── Paramètres ────────────────────────────────────────────────────────────────
-CAPITAL_TOTAL = 100.0       # USDC
-POSITION_SIZE = 20.0        # USDC par position
+CAPITAL_TOTAL = 100.0
+POSITION_SIZE = 20.0
 MAX_POSITIONS = 5
-TRAILING_STOP_PCT = 1.5     # %
-STOP_LOSS_PCT = 2.0         # %
-MAX_DAILY_DRAWDOWN_PCT = 10 # %
+TRAILING_STOP_PCT = 1.5
+STOP_LOSS_PCT = 2.0
+MAX_DAILY_DRAWDOWN_PCT = 10
 TIMEFRAME = "1h"
+PERSISTENCE_FILE = "positions.json"
 
 
 class TradingStrategy:
@@ -23,7 +26,7 @@ class TradingStrategy:
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
         })
-        self.positions: dict = {}       # symbol → position dict
+        self.positions: dict = {}
         self.capital = CAPITAL_TOTAL
         self.daily_start_capital = CAPITAL_TOTAL
         self.pnl = 0.0
@@ -32,6 +35,47 @@ class TradingStrategy:
         self.losses = 0
         self._usdc_pairs: list = []
         self._last_pair_refresh = 0
+
+        # Rechargement état persisté au démarrage
+        self._load_state()
+
+    # ── Persistance ───────────────────────────────────────────────────────────
+    def _save_state(self):
+        state = {
+            "positions": self.positions,
+            "capital": self.capital,
+            "daily_start_capital": self.daily_start_capital,
+            "pnl": self.pnl,
+            "total_trades": self.total_trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "saved_at": datetime.utcnow().isoformat(),
+        }
+        try:
+            with open(PERSISTENCE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+            log.debug("État sauvegardé")
+        except Exception as e:
+            log.error(f"Erreur sauvegarde état : {e}")
+
+    def _load_state(self):
+        if not os.path.exists(PERSISTENCE_FILE):
+            log.info("Aucun état persisté trouvé — démarrage à zéro")
+            return
+        try:
+            with open(PERSISTENCE_FILE, "r") as f:
+                state = json.load(f)
+            self.positions = state.get("positions", {})
+            self.capital = state.get("capital", CAPITAL_TOTAL)
+            self.daily_start_capital = state.get("daily_start_capital", CAPITAL_TOTAL)
+            self.pnl = state.get("pnl", 0.0)
+            self.total_trades = state.get("total_trades", 0)
+            self.wins = state.get("wins", 0)
+            self.losses = state.get("losses", 0)
+            saved_at = state.get("saved_at", "inconnue")
+            log.info(f"État rechargé — {len(self.positions)} position(s) | sauvegardé le {saved_at}")
+        except Exception as e:
+            log.error(f"Erreur chargement état : {e}")
 
     # ── Paires USDC ───────────────────────────────────────────────────────────
     def _get_usdc_pairs(self) -> list:
@@ -54,7 +98,7 @@ class TradingStrategy:
             log.error(f"Erreur chargement marchés : {e}")
         return self._usdc_pairs
 
-    # ── OHLCV + momentum ──────────────────────────────────────────────────────
+    # ── OHLCV + signal momentum ───────────────────────────────────────────────
     def _fetch_ohlcv(self, symbol: str) -> pd.DataFrame | None:
         try:
             data = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
@@ -66,10 +110,10 @@ class TradingStrategy:
 
     def _momentum_signal(self, df: pd.DataFrame) -> bool:
         """
-        Signal d'entrée long :
-        - EMA20 > EMA50 (tendance haussière)
-        - Dernière bougie clôture au-dessus EMA20
-        - Volume dernière bougie > moyenne vol × 1.2
+        Signal long :
+        - EMA20 > EMA50
+        - Clôture > EMA20
+        - Volume dernière bougie > moyenne × 1.2
         """
         if df is None or len(df) < 50:
             return False
@@ -104,6 +148,7 @@ class TradingStrategy:
             "opened_at": datetime.utcnow().isoformat(),
         }
         self.capital -= POSITION_SIZE
+        self._save_state()
         log.info(f"[PAPER] ACHAT {symbol} @ {price:.4f} | {POSITION_SIZE} USDC")
         return (
             f"🟢 *Entrée PAPER* `{symbol}`\n"
@@ -130,6 +175,7 @@ class TradingStrategy:
         else:
             self.losses += 1
             emoji = "❌"
+        self._save_state()
         log.info(f"[PAPER] CLÔTURE {symbol} @ {price:.4f} | PnL : {pnl:+.2f} USDC | {reason}")
         return (
             f"{emoji} *Clôture PAPER* `{symbol}` — {reason}\n"
@@ -215,4 +261,3 @@ class TradingStrategy:
                 "pnl_pct": pnl_pct,
             })
         return result
-      
