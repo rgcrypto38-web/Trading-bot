@@ -30,7 +30,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 PARIS_TZ         = timezone(timedelta(hours=2))  # UTC+2 été / hours=1 en hiver
 RECAP_START_HOUR = 7
 RECAP_END_HOUR   = 22
-MORNING_HOUR     = 7   # heure du rapport matin + analyse positions
+MORNING_HOUR     = 7
 
 # ── Clavier Telegram ──────────────────────────────────────────────────────────
 KEYBOARD = {
@@ -64,9 +64,10 @@ bot_paused      = False
 strategy        = None
 last_update_id  = 0
 last_recap_hour = -1
+last_reset_date = ""
 
 
-# ── Telegram helpers ──────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 def send_message(text: str, chat_id: str = None):
     cid = chat_id or TELEGRAM_CHAT_ID
     try:
@@ -97,7 +98,7 @@ def get_updates(offset: int = 0):
         return []
 
 
-# ── Construction du récap ─────────────────────────────────────────────────────
+# ── Récap ─────────────────────────────────────────────────────────────────────
 def build_recap() -> str:
     if not strategy:
         return ""
@@ -109,27 +110,19 @@ def build_recap() -> str:
     lines = [
         f"🕐 *Récap {now}* — Mode PAPER | {state}",
         f"💼 Capital disponible : `{stats['capital']:.2f}` USDC",
-        f"📈 PnL total réalisé : `{stats['pnl']:+.2f}` USDC",
+        f"📈 PnL du jour : `{stats['pnl_today']:+.2f}` USDC | Total : `{stats['pnl']:+.2f}` USDC",
         f"🔢 Trades : {stats['total_trades']} (✅ {stats['wins']} / ❌ {stats['losses']})",
     ]
 
     if positions:
         lines.append(f"\n📊 *{len(positions)} position(s) ouverte(s) :*")
         for p in positions:
-            # Emoji selon situation
-            if p["pnl_pct"] >= 0:
-                trend = "📈"
-            else:
-                trend = "📉"
-
-            # Gain sécurisé : positif = gain garanti, négatif = perte max si TS
+            trend     = "📈" if p["pnl_pct"] >= 0 else "📉"
             sec_emoji = "🔒" if p["secured_pct"] >= 0 else "⚠️"
-
             lines.append(
                 f"\n{trend} `{p['symbol']}`\n"
-                f"  Entrée : `{p['entry']:.4f}` | PnL actuel : `{p['pnl_pct']:+.2f}%`\n"
-                f"  {sec_emoji} Si TS déclenché → `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)\n"
-                f"  TS actuel : `{p['ts_price']:.4f}`"
+                f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}` | PnL : `{p['pnl_pct']:+.2f}%`\n"
+                f"  {sec_emoji} Gain sécurisé si TS : `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -137,7 +130,6 @@ def build_recap() -> str:
     return "\n".join(lines)
 
 
-# ── Logique récap horaire ─────────────────────────────────────────────────────
 def should_send_recap() -> bool:
     global last_recap_hour
     now          = datetime.now(PARIS_TZ)
@@ -149,7 +141,18 @@ def should_send_recap() -> bool:
     return False
 
 
-# ── Commandes / boutons ───────────────────────────────────────────────────────
+# ── Reset minuit ──────────────────────────────────────────────────────────────
+def check_midnight_reset():
+    global last_reset_date
+    today = datetime.now(PARIS_TZ).date().isoformat()
+    if today != last_reset_date:
+        last_reset_date = today
+        if strategy:
+            strategy.reset_daily_pnl()
+            log.info("Reset PnL journalier effectué")
+
+
+# ── Actions ───────────────────────────────────────────────────────────────────
 def handle_action(action: str, chat_id: str):
     global bot_running, bot_paused, strategy
 
@@ -169,8 +172,8 @@ def handle_action(action: str, chat_id: str):
         threading.Thread(target=trading_loop, daemon=True).start()
         send_message(
             f"✅ *Bot démarré* — Mode PAPER\n"
-            f"💰 100 USDC | 5 × 20 USDC | SL -2% | TS -1.5%\n"
-            f"🕐 Récaps : 7h → 22h | Analyse matin : 7h{recap}",
+            f"💰 100 USDC | 5 × 20 USDC | SL -2% | TS -2%\n"
+            f"🕐 Récaps : {RECAP_START_HOUR}h → {RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
             chat_id,
         )
 
@@ -182,7 +185,11 @@ def handle_action(action: str, chat_id: str):
             send_message("ℹ️ Déjà en pause. Tape ▶️ Démarrer pour reprendre.", chat_id)
             return
         bot_paused = True
-        send_message("⏸ *Pause* — positions conservées, aucune nouvelle entrée.", chat_id)
+        send_message(
+            "⏸ *Pause* — positions conservées, aucune nouvelle entrée.\n"
+            "⚠️ Les stops restent actifs en pause.",
+            chat_id,
+        )
 
     elif action == "stop":
         if not bot_running:
@@ -211,8 +218,8 @@ def handle_action(action: str, chat_id: str):
             sec_emoji = "🔒" if p["secured_pct"] >= 0 else "⚠️"
             lines.append(
                 f"\n`{p['symbol']}`\n"
-                f"  Entrée : `{p['entry']:.4f}` | PnL : `{p['pnl_pct']:+.2f}%`\n"
-                f"  {sec_emoji} Si TS → `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)"
+                f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}` | PnL : `{p['pnl_pct']:+.2f}%`\n"
+                f"  {sec_emoji} Si TS déclenché → `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)"
             )
         send_message("\n".join(lines), chat_id)
 
@@ -220,13 +227,13 @@ def handle_action(action: str, chat_id: str):
         send_message(
             "⚙️ *Aide*\n\n"
             "▶️ Démarrer — Lancer / reprendre\n"
-            "⏸ Pause — Suspendre sans fermer les positions\n"
+            "⏸ Pause — Suspendre _(stops toujours actifs)_\n"
             "⏹ Arrêter — Arrêt complet\n"
             "📊 Statut — Capital, PnL, gain sécurisé\n"
             "📋 Trades — Positions ouvertes détaillées\n"
             "⚙️ Aide — Cette aide\n\n"
-            "_SL : -2% | TS : -1.5% depuis le plus haut_\n"
-            "_Analyse matin automatique à 7h_",
+            "_SL : -2% depuis entrée | TS : -2% depuis le plus haut_\n"
+            "_Analyse matin automatique à 7h avec verdict Garder/Abandonner_",
             chat_id,
         )
 
@@ -239,17 +246,20 @@ def trading_loop():
         try:
             now_paris = datetime.now(PARIS_TZ)
 
-            # Analyse matin (7h, une fois par jour)
-            if now_paris.hour == MORNING_HOUR and strategy and strategy.positions:
+            # Reset PnL journalier à minuit
+            check_midnight_reset()
+
+            # Analyse matin à 7h (une fois par jour)
+            if now_paris.hour == MORNING_HOUR and strategy:
                 morning_msgs = strategy.morning_analysis()
                 for msg in morning_msgs:
                     send_message(msg)
 
-            # Scan marché
-            if not bot_paused:
-                alerts = strategy.scan()
-                for alert in alerts:
-                    send_message(alert)
+            # Scan marché — stops TOUJOURS vérifiés, même en pause
+            # (la garde drawdown est dans scan(), après la vérification des positions)
+            alerts = strategy.scan()
+            for alert in alerts:
+                send_message(alert)
 
             # Récap horaire
             if should_send_recap():
@@ -293,3 +303,4 @@ def telegram_loop():
 if __name__ == "__main__":
     log.info("Démarrage")
     telegram_loop()
+    
