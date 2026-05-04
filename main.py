@@ -120,9 +120,7 @@ def build_recap() -> str:
             trend     = "📈" if p["pnl_pct"] >= 0 else "📉"
             sec_emoji = "🔒" if p["secured_pct"] >= 0 else "⚠️"
             lines.append(
-                f"\n{trend} `{p['symbol']}`\n"
-                f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}` | PnL : `{p['pnl_pct']:+.2f}%`\n"
-                f"  {sec_emoji} Gain sécurisé si TS : `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)"
+                f"{trend} `{p['symbol']}` | PnL : `{p['pnl_pct']:+.2f}%` | {sec_emoji} Gain sécurisé : `{p['secured_pnl']:+.2f}` USDC"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
