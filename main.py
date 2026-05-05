@@ -98,7 +98,34 @@ def get_updates(offset: int = 0):
         return []
 
 
-# ── Récap ─────────────────────────────────────────────────────────────────────
+# ── Statut ────────────────────────────────────────────────────────────────────
+def build_status() -> str:
+    if not strategy:
+        return "🔴 Bot arrêté."
+    stats     = strategy.get_stats()
+    positions = strategy.get_positions()
+    state     = "⏸ En pause" if bot_paused else "🟢 Actif"
+
+    lines = [
+        f"{state} — Mode PAPER",
+        f"💼 Capital : `{stats['capital']:.2f}` USDC | G/P jour : `{stats['pnl_today']:+.2f}` USDC | G/P total : `{stats['pnl']:+.2f}` USDC",
+        f"🔢 Trades : {stats['total_trades']} (✅ {stats['wins']} / ❌ {stats['losses']})",
+    ]
+
+    if positions:
+        lines.append(f"\n📌 *Positions ouvertes :*")
+        for p in positions:
+            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+            lines.append(
+                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
+            )
+    else:
+        lines.append("\n📭 Aucune position ouverte")
+
+    return "\n".join(lines)
+
+
+# ── Récap horaire ─────────────────────────────────────────────────────────────
 def build_recap() -> str:
     if not strategy:
         return ""
@@ -108,19 +135,18 @@ def build_recap() -> str:
     state     = "⏸ En pause" if bot_paused else "🟢 Actif"
 
     lines = [
-        f"🕐 *Récap {now}* — Mode PAPER | {state}",
-        f"💼 Capital disponible : `{stats['capital']:.2f}` USDC",
-        f"📈 PnL du jour : `{stats['pnl_today']:+.2f}` USDC | Total : `{stats['pnl']:+.2f}` USDC",
-        f"🔢 Trades : {stats['total_trades']} (✅ {stats['wins']} / ❌ {stats['losses']})",
+        f"🕐 *Récap {now}* — {state}",
+        f"💼 `{stats['capital']:.2f}` USDC | G/P jour : `{stats['pnl_today']:+.2f}` | Total : `{stats['pnl']:+.2f}` USDC",
+        f"🔢 {stats['total_trades']} trades (✅ {stats['wins']} / ❌ {stats['losses']})",
     ]
 
     if positions:
-        lines.append(f"\n📊 *{len(positions)} position(s) ouverte(s) :*")
+        lines.append(f"\n📌 *{len(positions)} position(s) :*")
         for p in positions:
-            trend     = "📈" if p["pnl_pct"] >= 0 else "📉"
-            sec_emoji = "🔒" if p["secured_pct"] >= 0 else "⚠️"
+            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
+            sec_emoji = "💵" if p["secured_pnl"] >= 0 else "💵"
             lines.append(
-                f"{trend} `{p['symbol']}` | PnL : `{p['pnl_pct']:+.2f}%` | {sec_emoji} Gain sécurisé : `{p['secured_pnl']:+.2f}` USDC"
+                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | {sec_emoji} Gain : `{p['secured_pnl']:+.2f}` USDC"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -128,14 +154,32 @@ def build_recap() -> str:
     return "\n".join(lines)
 
 
+# ── Trades détaillés ──────────────────────────────────────────────────────────
+def build_trades() -> str:
+    if not strategy:
+        return "ℹ️ Aucune stratégie active."
+    positions = strategy.get_positions()
+    if not positions:
+        return "📭 Aucune position ouverte."
+
+    lines = ["📋 *Positions ouvertes :*\n"]
+    for p in positions:
+        gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+        lines.append(
+            f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
+            f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}`\n"
+            f"  TS à : `{p['ts_price']:.4f}` | 💵 Gain : `{p['secured_pnl']:+.2f}` USDC\n"
+        )
+    return "\n".join(lines)
+
+
 def should_send_recap() -> bool:
     global last_recap_hour
-    now          = datetime.now(PARIS_TZ)
-    current_hour = now.hour
-    if RECAP_START_HOUR <= current_hour < RECAP_END_HOUR:
-        if current_hour != last_recap_hour:
-            last_recap_hour = current_hour
-            return True
+    now = datetime.now(PARIS_TZ)
+    h   = now.hour
+    if RECAP_START_HOUR <= h < RECAP_END_HOUR and h != last_recap_hour:
+        last_recap_hour = h
+        return True
     return False
 
 
@@ -147,7 +191,6 @@ def check_midnight_reset():
         last_reset_date = today
         if strategy:
             strategy.reset_daily_pnl()
-            log.info("Reset PnL journalier effectué")
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
@@ -160,18 +203,18 @@ def handle_action(action: str, chat_id: str):
             return
         if bot_paused:
             bot_paused = False
-            send_message("▶️ *Bot repris* — scan actif.", chat_id)
+            send_message("▶️ *Bot repris.*", chat_id)
             return
         bot_running = True
         bot_paused  = False
         strategy    = TradingStrategy(binance_key=BINANCE_KEY, binance_secret=BINANCE_SECRET)
         nb_pos      = len(strategy.positions)
-        recap       = f"\n\n📂 {nb_pos} position(s) rechargée(s)." if nb_pos > 0 else ""
+        recap       = f"\n📂 {nb_pos} position(s) rechargée(s)." if nb_pos > 0 else ""
         threading.Thread(target=trading_loop, daemon=True).start()
         send_message(
             f"✅ *Bot démarré* — Mode PAPER\n"
-            f"💰 100 USDC | 5 × 20 USDC | SL -2% | TS -2%\n"
-            f"🕐 Récaps : {RECAP_START_HOUR}h → {RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
+            f"💰 Capital : 100 USDC | SL -2% | TS -2% | RSI < 65 | Volume ×2 | Filtre 4h\n"
+            f"🕐 Récaps : {RECAP_START_HOUR}h–{RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
             chat_id,
         )
 
@@ -180,14 +223,10 @@ def handle_action(action: str, chat_id: str):
             send_message("ℹ️ Le bot n'est pas démarré.", chat_id)
             return
         if bot_paused:
-            send_message("ℹ️ Déjà en pause. Tape ▶️ Démarrer pour reprendre.", chat_id)
+            send_message("ℹ️ Déjà en pause.", chat_id)
             return
         bot_paused = True
-        send_message(
-            "⏸ *Pause* — positions conservées, aucune nouvelle entrée.\n"
-            "⚠️ Les stops restent actifs en pause.",
-            chat_id,
-        )
+        send_message("⏸ *Pause* — stops toujours actifs.", chat_id)
 
     elif action == "stop":
         if not bot_running:
@@ -198,68 +237,44 @@ def handle_action(action: str, chat_id: str):
         send_message("⏹ *Bot arrêté.* Positions sauvegardées.", chat_id)
 
     elif action == "status":
-        if not bot_running:
-            send_message("🔴 Bot *arrêté*.", chat_id)
-        else:
-            send_message(build_recap(), chat_id)
+        send_message(build_status(), chat_id)
 
     elif action == "positions":
-        if not strategy:
-            send_message("ℹ️ Aucune stratégie active.", chat_id)
-            return
-        positions = strategy.get_positions()
-        if not positions:
-            send_message("📭 Aucune position ouverte.", chat_id)
-            return
-        lines = ["📊 *Positions ouvertes :*"]
-        for p in positions:
-            sec_emoji = "🔒" if p["secured_pct"] >= 0 else "⚠️"
-            lines.append(
-                f"\n`{p['symbol']}`\n"
-                f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}` | PnL : `{p['pnl_pct']:+.2f}%`\n"
-                f"  {sec_emoji} Si TS déclenché → `{p['secured_pct']:+.2f}%` (`{p['secured_pnl']:+.2f}` USDC)"
-            )
-        send_message("\n".join(lines), chat_id)
+        send_message(build_trades(), chat_id)
 
     elif action == "help":
         send_message(
             "⚙️ *Aide*\n\n"
             "▶️ Démarrer — Lancer / reprendre\n"
-            "⏸ Pause — Suspendre _(stops toujours actifs)_\n"
+            "⏸ Pause — Suspendre _(stops actifs)_\n"
             "⏹ Arrêter — Arrêt complet\n"
-            "📊 Statut — Capital, PnL, gain sécurisé\n"
-            "📋 Trades — Positions ouvertes détaillées\n"
+            "📊 Statut — Capital et positions\n"
+            "📋 Trades — Détail des positions ouvertes\n"
             "⚙️ Aide — Cette aide\n\n"
-            "_SL : -2% depuis entrée | TS : -2% depuis le plus haut_\n"
-            "_Analyse matin automatique à 7h avec verdict Garder/Abandonner_",
+            "_Signal : EMA20>50 sur 1h ET 4h | Volume ×2 | RSI < 65_\n"
+            "_SL : -2% | TS : -2% depuis le plus haut_\n"
+            "_Analyse matin 7h : tendance 1h+4h, fermeture auto si invalide_",
             chat_id,
         )
 
 
 # ── Boucle de trading ─────────────────────────────────────────────────────────
 def trading_loop():
-    global bot_running, bot_paused
     log.info("Boucle démarrée")
     while bot_running:
         try:
-            now_paris = datetime.now(PARIS_TZ)
-
-            # Reset PnL journalier à minuit
             check_midnight_reset()
 
-            # Analyse matin à 7h (une fois par jour)
+            now_paris = datetime.now(PARIS_TZ)
             if now_paris.hour == MORNING_HOUR and strategy:
-                morning_msgs = strategy.morning_analysis()
-                for msg in morning_msgs:
+                for msg in strategy.morning_analysis():
                     send_message(msg)
 
-            # Scan marché — stops TOUJOURS vérifiés, même en pause
-            # (la garde drawdown est dans scan(), après la vérification des positions)
+            # Scan toujours actif (stops vérifiés même en pause)
             alerts = strategy.scan()
             for alert in alerts:
                 send_message(alert)
 
-            # Récap horaire
             if should_send_recap():
                 recap = build_recap()
                 if recap:
@@ -267,7 +282,7 @@ def trading_loop():
 
         except Exception as e:
             log.error(f"Erreur boucle : {e}")
-            send_message(f"⚠️ Erreur interne : `{e}`")
+            send_message(f"⚠️ Erreur : `{e}`")
 
         time.sleep(60)
 
@@ -278,7 +293,7 @@ def trading_loop():
 def telegram_loop():
     global last_update_id
     log.info("Écoute Telegram démarrée")
-    send_message("🤖 *Bot en ligne* — utilise les boutons ou tape ⚙️ Aide.")
+    send_message("🤖 *Bot en ligne* — utilise les boutons ou ⚙️ Aide.")
     while True:
         updates = get_updates(offset=last_update_id + 1)
         for update in updates:
@@ -290,7 +305,6 @@ def telegram_loop():
                 continue
             action = BUTTON_MAP.get(text.lower())
             if action:
-                log.info(f"Action : {action}")
                 handle_action(action, chat_id)
             else:
                 send_message(f"❓ Non reconnu : `{text}`\nUtilise les boutons ou ⚙️ Aide.", chat_id)
@@ -301,4 +315,3 @@ def telegram_loop():
 if __name__ == "__main__":
     log.info("Démarrage")
     telegram_loop()
-        
