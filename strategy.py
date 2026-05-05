@@ -9,12 +9,15 @@ log = logging.getLogger(__name__)
 
 # ── Paramètres ────────────────────────────────────────────────────────────────
 CAPITAL_TOTAL          = 100.0
-POSITION_SIZE          = 20.0
 MAX_POSITIONS          = 5
-TRAILING_STOP_PCT      = 2.0    # % depuis le plus haut
-STOP_LOSS_PCT          = 2.0    # % depuis l'entrée
-MAX_DAILY_LOSS_USDC    = 10.0   # perte journalière max en USDC (10% de 100)
-TIMEFRAME              = "1h"
+POSITION_SIZE_MIN      = 15.0    # USDC minimum par position
+TRAILING_STOP_PCT      = 2.0     # % depuis le plus haut
+STOP_LOSS_PCT          = 2.0     # % depuis l'entrée
+MAX_DAILY_LOSS_USDC    = 10.0    # perte journalière max en USDC
+RSI_MAX_ENTRY          = 65      # ne pas entrer si RSI > cette valeur
+VOLUME_MULTIPLIER      = 2.0     # volume min vs moyenne pour entrer
+TIMEFRAME_SHORT        = "1h"
+TIMEFRAME_LONG         = "4h"
 PERSISTENCE_FILE       = "positions.json"
 
 PARIS_TZ = timezone(timedelta(hours=2))
@@ -28,31 +31,31 @@ class TradingStrategy:
             "enableRateLimit": True,
             "options":         {"defaultType": "spot"},
         })
-        self.positions:           dict  = {}
-        self.capital:             float = CAPITAL_TOTAL
-        self.pnl:                 float = 0.0        # PnL total cumulé
-        self.daily_start_pnl:     float = 0.0        # PnL au début de la journée
-        self.total_trades:        int   = 0
-        self.wins:                int   = 0
-        self.losses:              int   = 0
-        self._usdc_pairs:         list  = []
-        self._last_pair_refresh:  float = 0
-        self._morning_done_date:  str   = ""
+        self.positions:          dict  = {}
+        self.capital:            float = CAPITAL_TOTAL
+        self.pnl:                float = 0.0
+        self.daily_start_pnl:    float = 0.0
+        self.total_trades:       int   = 0
+        self.wins:               int   = 0
+        self.losses:             int   = 0
+        self._usdc_pairs:        list  = []
+        self._last_pair_refresh: float = 0
+        self._morning_done_date: str   = ""
 
         self._load_state()
 
     # ── Persistance ───────────────────────────────────────────────────────────
     def _save_state(self):
         state = {
-            "positions":        self.positions,
-            "capital":          self.capital,
-            "pnl":              self.pnl,
-            "daily_start_pnl":  self.daily_start_pnl,
-            "total_trades":     self.total_trades,
-            "wins":             self.wins,
-            "losses":           self.losses,
+            "positions":         self.positions,
+            "capital":           self.capital,
+            "pnl":               self.pnl,
+            "daily_start_pnl":   self.daily_start_pnl,
+            "total_trades":      self.total_trades,
+            "wins":              self.wins,
+            "losses":            self.losses,
             "morning_done_date": self._morning_done_date,
-            "saved_at":         datetime.utcnow().isoformat(),
+            "saved_at":          datetime.utcnow().isoformat(),
         }
         try:
             with open(PERSISTENCE_FILE, "w") as f:
@@ -67,28 +70,34 @@ class TradingStrategy:
         try:
             with open(PERSISTENCE_FILE, "r") as f:
                 state = json.load(f)
-            self.positions           = state.get("positions", {})
-            self.capital             = state.get("capital", CAPITAL_TOTAL)
-            self.pnl                 = state.get("pnl", 0.0)
-            self.daily_start_pnl     = state.get("daily_start_pnl", 0.0)
-            self.total_trades        = state.get("total_trades", 0)
-            self.wins                = state.get("wins", 0)
-            self.losses              = state.get("losses", 0)
-            self._morning_done_date  = state.get("morning_done_date", "")
+            self.positions         = state.get("positions", {})
+            self.capital           = state.get("capital", CAPITAL_TOTAL)
+            self.pnl               = state.get("pnl", 0.0)
+            self.daily_start_pnl   = state.get("daily_start_pnl", 0.0)
+            self.total_trades      = state.get("total_trades", 0)
+            self.wins              = state.get("wins", 0)
+            self.losses            = state.get("losses", 0)
+            self._morning_done_date = state.get("morning_done_date", "")
             log.info(f"État rechargé — {len(self.positions)} position(s)")
         except Exception as e:
             log.error(f"Erreur chargement état : {e}")
 
-    # ── Reset PnL journalier (appelé à minuit) ────────────────────────────────
     def reset_daily_pnl(self):
         self.daily_start_pnl = self.pnl
         self._save_state()
-        log.info(f"Reset PnL journalier — base : {self.daily_start_pnl:.2f} USDC")
+        log.info(f"Reset G/P journalier — base : {self.daily_start_pnl:.2f} USDC")
 
-    # ── Drawdown : basé sur PnL réalisé uniquement ────────────────────────────
+    # ── Drawdown ──────────────────────────────────────────────────────────────
     def _daily_drawdown_reached(self) -> bool:
-        pnl_today = self.pnl - self.daily_start_pnl
-        return pnl_today <= -MAX_DAILY_LOSS_USDC
+        return (self.pnl - self.daily_start_pnl) <= -MAX_DAILY_LOSS_USDC
+
+    # ── Taille de position dynamique ──────────────────────────────────────────
+    def _position_size(self) -> float:
+        slots_libres = MAX_POSITIONS - len(self.positions)
+        if slots_libres <= 0:
+            return 0.0
+        taille = self.capital / slots_libres
+        return taille if taille >= POSITION_SIZE_MIN else 0.0
 
     # ── Paires USDC ───────────────────────────────────────────────────────────
     def _get_usdc_pairs(self) -> list:
@@ -110,44 +119,104 @@ class TradingStrategy:
         return self._usdc_pairs
 
     # ── OHLCV ─────────────────────────────────────────────────────────────────
-    def _fetch_ohlcv(self, symbol: str, timeframe: str = None, limit: int = 50) -> pd.DataFrame | None:
-        tf = timeframe or TIMEFRAME
+    def _fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 60) -> pd.DataFrame | None:
         try:
-            data = self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
+            data = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df   = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "vol"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             return df
         except Exception:
             return None
 
-    # ── Signal momentum ───────────────────────────────────────────────────────
+    # ── Calcul RSI ────────────────────────────────────────────────────────────
+    def _rsi(self, series: pd.Series, period: int = 14) -> float:
+        delta  = series.diff()
+        gain   = delta.clip(lower=0).rolling(period).mean()
+        loss   = (-delta.clip(upper=0)).rolling(period).mean()
+        rs     = gain / loss.replace(0, 1e-10)
+        rsi    = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
+
+    # ── Analyse signal entrée (1h + 4h + RSI + volume) ───────────────────────
     def _analyze_signal(self, symbol: str) -> dict:
         result = {"valid": False, "price": 0.0, "details": ""}
-        df = self._fetch_ohlcv(symbol)
-        if df is None or len(df) < 50:
-            result["details"] = "Données insuffisantes"
+
+        # ── Timeframe 1h ──────────────────────────────────────────────────────
+        df1 = self._fetch_ohlcv(symbol, TIMEFRAME_SHORT, limit=60)
+        if df1 is None or len(df1) < 50:
+            result["details"] = "Données 1h insuffisantes"
             return result
 
-        df["ema20"]  = df["close"].ewm(span=20).mean()
-        df["ema50"]  = df["close"].ewm(span=50).mean()
-        df["vol_ma"] = df["vol"].rolling(20).mean()
-        last = df.iloc[-1]
+        df1["ema20"]  = df1["close"].ewm(span=20).mean()
+        df1["ema50"]  = df1["close"].ewm(span=50).mean()
+        df1["vol_ma"] = df1["vol"].rolling(20).mean()
+        last1 = df1.iloc[-1]
 
-        ema_ok    = last["ema20"] > last["ema50"]
-        close_ok  = last["close"] > last["ema20"]
-        vol_ratio = last["vol"] / last["vol_ma"] if last["vol_ma"] > 0 else 0
-        vol_ok    = vol_ratio > 1.2
+        ema1h_ok   = last1["ema20"] > last1["ema50"]
+        close1h_ok = last1["close"] > last1["ema20"]
+        vol_ratio  = last1["vol"] / last1["vol_ma"] if last1["vol_ma"] > 0 else 0
+        vol_ok     = vol_ratio >= VOLUME_MULTIPLIER
+        rsi_val    = self._rsi(df1["close"])
+        rsi_ok     = rsi_val < RSI_MAX_ENTRY
 
-        result["price"] = last["close"]
-        result["valid"] = ema_ok and close_ok and vol_ok
+        # ── Timeframe 4h ──────────────────────────────────────────────────────
+        df4 = self._fetch_ohlcv(symbol, TIMEFRAME_LONG, limit=60)
+        ema4h_ok = False
+        ema4h_str = "Données insuffisantes"
+        if df4 is not None and len(df4) >= 50:
+            df4["ema20"] = df4["close"].ewm(span=20).mean()
+            df4["ema50"] = df4["close"].ewm(span=50).mean()
+            last4    = df4.iloc[-1]
+            ema4h_ok = last4["ema20"] > last4["ema50"]
+            ema4h_str = f"EMA20 ({last4['ema20']:.4f}) {'>' if ema4h_ok else '<'} EMA50 ({last4['ema50']:.4f})"
+
+        result["price"] = last1["close"]
+        result["valid"] = ema1h_ok and close1h_ok and vol_ok and rsi_ok and ema4h_ok
         result["details"] = "\n".join([
-            f"{'✅' if ema_ok   else '❌'} EMA20 ({last['ema20']:.4f}) {'>' if ema_ok else '<'} EMA50 ({last['ema50']:.4f})",
-            f"{'✅' if close_ok else '❌'} Clôture ({last['close']:.4f}) {'>' if close_ok else '<'} EMA20",
-            f"{'✅' if vol_ok   else '❌'} Volume ×{vol_ratio:.2f} la moyenne (seuil ×1.2)",
+            f"{'✅' if ema1h_ok   else '❌'} [1h] EMA20 ({last1['ema20']:.4f}) {'>' if ema1h_ok else '<'} EMA50 ({last1['ema50']:.4f})",
+            f"{'✅' if close1h_ok else '❌'} [1h] Clôture ({last1['close']:.4f}) {'>' if close1h_ok else '<'} EMA20",
+            f"{'✅' if vol_ok     else '❌'} [1h] Volume ×{vol_ratio:.2f} (seuil ×{VOLUME_MULTIPLIER})",
+            f"{'✅' if rsi_ok     else '❌'} [1h] RSI {rsi_val:.1f} ({'OK' if rsi_ok else f'> {RSI_MAX_ENTRY} — surachat'})",
+            f"{'✅' if ema4h_ok   else '❌'} [4h] {ema4h_str}",
         ])
         return result
 
-    # ── Vérification SL robuste (prix actuel + low bougie 1m) ─────────────────
+    # ── Analyse matin (1h + 4h, sans volume ni RSI) ───────────────────────────
+    def _analyze_morning(self, symbol: str) -> dict:
+        result = {"valid": False, "price": 0.0, "details": ""}
+
+        df1 = self._fetch_ohlcv(symbol, TIMEFRAME_SHORT, limit=60)
+        if df1 is None or len(df1) < 50:
+            result["details"] = "Données 1h insuffisantes"
+            return result
+
+        df1["ema20"] = df1["close"].ewm(span=20).mean()
+        df1["ema50"] = df1["close"].ewm(span=50).mean()
+        last1 = df1.iloc[-1]
+
+        ema1h_ok   = last1["ema20"] > last1["ema50"]
+        close1h_ok = last1["close"] > last1["ema20"]
+
+        df4 = self._fetch_ohlcv(symbol, TIMEFRAME_LONG, limit=60)
+        ema4h_ok  = False
+        ema4h_str = "Données insuffisantes"
+        if df4 is not None and len(df4) >= 50:
+            df4["ema20"] = df4["close"].ewm(span=20).mean()
+            df4["ema50"] = df4["close"].ewm(span=50).mean()
+            last4     = df4.iloc[-1]
+            ema4h_ok  = last4["ema20"] > last4["ema50"]
+            ema4h_str = f"EMA20 ({last4['ema20']:.4f}) {'>' if ema4h_ok else '<'} EMA50 ({last4['ema50']:.4f})"
+
+        result["price"] = last1["close"]
+        result["valid"] = ema1h_ok and close1h_ok and ema4h_ok
+        result["details"] = "\n".join([
+            f"{'✅' if ema1h_ok   else '❌'} [1h] EMA20 {'>' if ema1h_ok else '<'} EMA50",
+            f"{'✅' if close1h_ok else '❌'} [1h] Clôture {'>' if close1h_ok else '<'} EMA20",
+            f"{'✅' if ema4h_ok   else '❌'} [4h] {ema4h_str}",
+        ])
+        return result
+
+    # ── Vérification SL robuste ───────────────────────────────────────────────
     def _check_sl_triggered(self, symbol: str, current_price: float, sl_level: float) -> tuple[bool, float]:
         if current_price <= sl_level:
             return True, current_price
@@ -164,20 +233,12 @@ class TradingStrategy:
 
     # ── Gain sécurisé ─────────────────────────────────────────────────────────
     def _secured_gain(self, pos: dict) -> dict:
-        """
-        Gain/perte si le TS se déclenche maintenant.
-        Formule : (TS_actuel - entrée) × qty
-        """
         ts_price    = pos["trailing_stop"]
         entry       = pos["entry"]
         qty         = pos["qty"]
         secured_pnl = (ts_price - entry) * qty
         secured_pct = (ts_price - entry) / entry * 100
-        return {
-            "ts_price":    ts_price,
-            "secured_pnl": secured_pnl,
-            "secured_pct": secured_pct,
-        }
+        return {"ts_price": ts_price, "secured_pnl": secured_pnl, "secured_pct": secured_pct}
 
     # ── Ouverture ─────────────────────────────────────────────────────────────
     def _open_position(self, symbol: str, analysis: dict) -> str:
@@ -185,31 +246,37 @@ class TradingStrategy:
             return ""
         if len(self.positions) >= MAX_POSITIONS:
             return ""
-        if self.capital < POSITION_SIZE:
+        size = self._position_size()
+        if size <= 0:
             return ""
 
         price = analysis["price"]
-        qty   = POSITION_SIZE / price
+        qty   = size / price
+        opened_at = datetime.utcnow().isoformat()
+
         self.positions[symbol] = {
             "symbol":        symbol,
             "entry":         price,
             "qty":           qty,
-            "size_usdc":     POSITION_SIZE,
+            "size_usdc":     size,
             "highest":       price,
             "stop_loss":     round(price * (1 - STOP_LOSS_PCT    / 100), 8),
             "trailing_stop": round(price * (1 - TRAILING_STOP_PCT / 100), 8),
-            "opened_at":     datetime.utcnow().isoformat(),
+            "opened_at":     opened_at,
         }
-        self.capital -= POSITION_SIZE
+        self.capital -= size
         self._save_state()
-        log.info(f"[PAPER] ACHAT {symbol} @ {price:.4f}")
+        log.info(f"[PAPER] ACHAT {symbol} @ {price:.4f} | {size:.2f} USDC")
 
         sl_price = price * (1 - STOP_LOSS_PCT / 100)
-        ts_price = price * (1 - TRAILING_STOP_PCT / 100)
+        ts_init  = price * (1 - TRAILING_STOP_PCT / 100)
+        opened_fmt = datetime.fromisoformat(opened_at).strftime("%d/%m %H:%M")
+
         return (
-            f"🟢 *Entrée PAPER* `{symbol}`\n"
-            f"Prix : `{price:.4f}` | Taille : {POSITION_SIZE} USDC\n"
-            f"SL : `{sl_price:.4f}` (-{STOP_LOSS_PCT}%) | TS initial : `{ts_price:.4f}` (-{TRAILING_STOP_PCT}%)\n\n"
+            f"✅ *Entrée — {symbol}*\n"
+            f"Ouvert le {opened_fmt}\n"
+            f"Prix : `{price:.4f}` | Taille : `{size:.2f}` USDC\n"
+            f"SL : `{sl_price:.4f}` (-{STOP_LOSS_PCT}%) | TS : `{ts_init:.4f}` (-{TRAILING_STOP_PCT}%)\n\n"
             f"📐 *Signal :*\n{analysis['details']}"
         )
 
@@ -223,21 +290,28 @@ class TradingStrategy:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return ""
-        pnl = (price - pos["entry"]) * pos["qty"]
+        pnl      = (price - pos["entry"]) * pos["qty"]
+        pnl_pct  = (price - pos["entry"]) / pos["entry"] * 100
         self.pnl     += pnl
         self.capital += pos["size_usdc"] + pnl
         self.total_trades += 1
         if pnl >= 0:
-            self.wins  += 1
-            emoji = "✅"
+            self.wins += 1
         else:
             self.losses += 1
-            emoji = "❌"
         self._save_state()
-        log.info(f"[PAPER] CLÔTURE {symbol} @ {price:.4f} | PnL : {pnl:+.2f} USDC | {reason}")
+        log.info(f"[PAPER] CLÔTURE {symbol} @ {price:.4f} | G/P : {pnl:+.2f} USDC | {reason}")
+
+        opened_at  = pos.get("opened_at", "")
+        closed_at  = datetime.utcnow().isoformat()
+        opened_fmt = datetime.fromisoformat(opened_at).strftime("%d/%m %H:%M") if opened_at else "—"
+        closed_fmt = datetime.fromisoformat(closed_at).strftime("%d/%m %H:%M")
+
         return (
-            f"{emoji} *Clôture PAPER* `{symbol}` — {reason}\n"
-            f"Prix : `{price:.4f}` | PnL : `{pnl:+.2f}` USDC"
+            f"❌ *Clôture — {symbol}* — {reason}\n"
+            f"Ouvert {opened_fmt} → Clôturé {closed_fmt}\n"
+            f"Entrée : `{pos['entry']:.4f}` | Sortie : `{price:.4f}`\n"
+            f"G/P : `{pnl:+.2f}` USDC (`{pnl_pct:+.2f}%`)"
         )
 
     # ── Analyse matin ─────────────────────────────────────────────────────────
@@ -252,13 +326,12 @@ class TradingStrategy:
         if not self.positions:
             return ["☀️ *Analyse matinale* — Aucune position ouverte."]
 
-        messages = ["☀️ *Analyse matinale des positions ouvertes*\n"]
+        messages = ["☀️ *Analyse matinale des positions*\n"]
         for symbol in list(self.positions.keys()):
             pos      = self.positions.get(symbol)
-            analysis = self._analyze_signal(symbol)
+            analysis = self._analyze_morning(symbol)
             try:
-                ticker = self.exchange.fetch_ticker(symbol)
-                price  = ticker["last"]
+                price = self.exchange.fetch_ticker(symbol)["last"]
             except Exception:
                 price = pos["entry"]
 
@@ -266,51 +339,45 @@ class TradingStrategy:
             secured = self._secured_gain(pos)
             verdict = "✅ *Garder*" if analysis["valid"] else "❌ *Abandonner*"
 
+            opened_fmt = ""
+            if pos.get("opened_at"):
+                opened_fmt = datetime.fromisoformat(pos["opened_at"]).strftime("%d/%m %H:%M")
+
             msg = (
                 f"─────────────────\n"
-                f"📌 `{symbol}` | PnL actuel : `{pnl_pct:+.2f}%`\n"
-                f"🔒 Gain sécurisé si TS : `{secured['secured_pct']:+.2f}%` (`{secured['secured_pnl']:+.2f}` USDC)\n\n"
+                f"📌 `{symbol}` | Ouvert le {opened_fmt}\n"
+                f"G/P actuel : `{pnl_pct:+.2f}%` | 💵 Gain si TS : `{secured['secured_pnl']:+.2f}` USDC\n\n"
                 f"*Indicateurs :*\n{analysis['details']}\n\n"
                 f"Verdict : {verdict}"
             )
             messages.append(msg)
 
             if not analysis["valid"]:
-                close_msg = self._close_position(symbol, price, "Abandon matin — signal invalide")
+                close_msg = self._close_position(symbol, price, "Abandon matin — tendance invalide")
                 if close_msg:
                     messages.append(close_msg)
 
         return messages
 
-    # ── SCAN PRINCIPAL ────────────────────────────────────────────────────────
+    # ── SCAN ──────────────────────────────────────────────────────────────────
     def scan(self) -> list[str]:
         alerts = []
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # ÉTAPE 1 — TOUJOURS vérifier les sorties, même si drawdown atteint
-        # ═══════════════════════════════════════════════════════════════════════
+        # Étape 1 — sorties toujours vérifiées en premier
         for symbol in list(self.positions.keys()):
             try:
-                ticker        = self.exchange.fetch_ticker(symbol)
-                current_price = ticker["last"]
+                current_price = self.exchange.fetch_ticker(symbol)["last"]
                 pos           = self.positions[symbol]
-
                 self._update_trailing_stop(pos, current_price)
 
-                # Stop Loss
-                sl_hit, sl_price = self._check_sl_triggered(
-                    symbol, current_price, pos["stop_loss"]
-                )
+                sl_hit, sl_price = self._check_sl_triggered(symbol, current_price, pos["stop_loss"])
                 if sl_hit:
                     msg = self._close_position(symbol, sl_price, "Stop Loss")
                     if msg:
                         alerts.append(msg)
                     continue
 
-                # Trailing Stop
-                ts_hit, ts_price = self._check_sl_triggered(
-                    symbol, current_price, pos["trailing_stop"]
-                )
+                ts_hit, ts_price = self._check_sl_triggered(symbol, current_price, pos["trailing_stop"])
                 if ts_hit:
                     msg = self._close_position(symbol, ts_price, "Trailing Stop")
                     if msg:
@@ -319,14 +386,13 @@ class TradingStrategy:
             except Exception as e:
                 log.error(f"Erreur mise à jour {symbol} : {e}")
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # ÉTAPE 2 — Nouvelles entrées bloquées si drawdown journalier atteint
-        # ═══════════════════════════════════════════════════════════════════════
+        # Étape 2 — nouvelles entrées bloquées si drawdown
         if self._daily_drawdown_reached():
-            log.warning(f"Drawdown journalier atteint — pas de nouvelles entrées")
+            log.warning("Drawdown journalier atteint — pas de nouvelles entrées")
             return alerts
 
-        if len(self.positions) < MAX_POSITIONS:
+        # Étape 3 — recherche de nouvelles entrées
+        if len(self.positions) < MAX_POSITIONS and self._position_size() > 0:
             for symbol in self._get_usdc_pairs():
                 if symbol in self.positions:
                     continue
@@ -345,11 +411,10 @@ class TradingStrategy:
 
     # ── Getters ───────────────────────────────────────────────────────────────
     def get_stats(self) -> dict:
-        pnl_today = self.pnl - self.daily_start_pnl
         return {
             "capital":      self.capital,
             "pnl":          self.pnl,
-            "pnl_today":    pnl_today,
+            "pnl_today":    self.pnl - self.daily_start_pnl,
             "total_trades": self.total_trades,
             "wins":         self.wins,
             "losses":       self.losses,
@@ -359,20 +424,24 @@ class TradingStrategy:
         result = []
         for symbol, pos in self.positions.items():
             try:
-                ticker  = self.exchange.fetch_ticker(symbol)
-                price   = ticker["last"]
+                price   = self.exchange.fetch_ticker(symbol)["last"]
                 pnl_pct = (price - pos["entry"]) / pos["entry"] * 100
             except Exception:
                 pnl_pct = 0.0
                 price   = pos["entry"]
-            secured = self._secured_gain(pos)
+            secured    = self._secured_gain(pos)
+            opened_fmt = ""
+            if pos.get("opened_at"):
+                opened_fmt = datetime.fromisoformat(pos["opened_at"]).strftime("%d/%m %H:%M")
             result.append({
                 "symbol":      symbol,
                 "entry":       pos["entry"],
                 "current":     price,
                 "pnl_pct":     pnl_pct,
-                "secured_pct": secured["secured_pct"],
+                "pnl_usdc":    (price - pos["entry"]) * pos["qty"],
                 "secured_pnl": secured["secured_pnl"],
+                "secured_pct": secured["secured_pct"],
+                "ts_price":    secured["ts_price"],
+                "opened_at":   opened_fmt,
             })
         return result
-        
