@@ -58,6 +58,9 @@ BUTTON_MAP = {
     "/help":       "help",
 }
 
+# Confirmations en attente : chat_id → {"action": "close"|"closeall", "symbol": str|None}
+pending_confirmations: dict = {}
+
 # ── État global ───────────────────────────────────────────────────────────────
 bot_running     = False
 bot_paused      = False
@@ -98,7 +101,7 @@ def get_updates(offset: int = 0):
         return []
 
 
-# ── Statut ────────────────────────────────────────────────────────────────────
+# ── Statut (/statut) ──────────────────────────────────────────────────────────
 def build_status() -> str:
     if not strategy:
         return "🔴 Bot arrêté."
@@ -143,10 +146,9 @@ def build_recap() -> str:
     if positions:
         lines.append(f"\n📌 *{len(positions)} position(s) :*")
         for p in positions:
-            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
-            sec_emoji = "💵" if p["secured_pnl"] >= 0 else "💵"
+            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
             lines.append(
-                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | {sec_emoji} Gain : `{p['secured_pnl']:+.2f}` USDC"
+                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | 💵 Gain : `{p['ts_pnl']:+.2f}` USDC"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -154,7 +156,7 @@ def build_recap() -> str:
     return "\n".join(lines)
 
 
-# ── Trades détaillés ──────────────────────────────────────────────────────────
+# ── Trades détaillés (/trades) ────────────────────────────────────────────────
 def build_trades() -> str:
     if not strategy:
         return "ℹ️ Aucune stratégie active."
@@ -167,8 +169,9 @@ def build_trades() -> str:
         gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
         lines.append(
             f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
-            f"  Entrée : `{p['entry']:.4f}` → Actuel : `{p['current']:.4f}`\n"
-            f"  TS à : `{p['ts_price']:.4f}` | 💵 Gain : `{p['secured_pnl']:+.2f}` USDC\n"
+            f"  Investi : `{p['size_usdc']:.2f}` USDC\n"
+            f"  Entrée : `{p['entry']:.6f}` → Actuel : `{p['current']:.6f}`\n"
+            f"  TS à : `{p['ts_price']:.6f}` | 💵 Résultat min si TS : `{p['ts_pnl']:+.2f}` USDC (`{p['ts_pct']:+.2f}%`)\n"
         )
     return "\n".join(lines)
 
@@ -193,9 +196,24 @@ def check_midnight_reset():
             strategy.reset_daily_pnl()
 
 
-# ── Actions ───────────────────────────────────────────────────────────────────
-def handle_action(action: str, chat_id: str):
+# ── Actions boutons / commandes ───────────────────────────────────────────────
+def handle_action(action: str, chat_id: str, raw_text: str = ""):
     global bot_running, bot_paused, strategy
+
+    # ── /debug SYMBOL ─────────────────────────────────────────────────────────
+    if action == "debug":
+        if not strategy:
+            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            return
+        parts = raw_text.strip().split()
+        if len(parts) < 2:
+            send_message("Usage : `/debug SYMBOL`\nEx : `/debug BTC/USDC`", chat_id)
+            return
+        symbol = parts[1].upper()
+        if "/" not in symbol:
+            symbol = symbol + "/USDC"
+        send_message(strategy.debug_position(symbol), chat_id)
+        return
 
     if action == "start":
         if bot_running and not bot_paused:
@@ -250,7 +268,10 @@ def handle_action(action: str, chat_id: str):
             "⏹ Arrêter — Arrêt complet\n"
             "📊 Statut — Capital et positions\n"
             "📋 Trades — Détail des positions ouvertes\n"
-            "⚙️ Aide — Cette aide\n\n"
+            "⚙️ Aide — Cette aide\n"
+            "`/debug SYMBOL` — Diagnostiquer une position\n"
+            "`/close SYMBOL` — Fermer une position manuellement\n"
+            "`/closeall` — Fermer toutes les positions\n\n"
             "_Signal : EMA20>50 sur 1h ET 4h | Volume ×2 | RSI < 65_\n"
             "_SL : -2% | TS : -2% depuis le plus haut_\n"
             "_Analyse matin 7h : tendance 1h+4h, fermeture auto si invalide_",
@@ -303,11 +324,28 @@ def telegram_loop():
             chat_id = str(msg.get("chat", {}).get("id", ""))
             if not text:
                 continue
+
+            # Commande /debug (avec argument)
+            if text.lower().startswith("/debug"):
+                handle_action("debug", chat_id, raw_text=text)
+                continue
+
+            # Commandes /close et /closeall
+            if text.lower().startswith("/close"):
+                handle_close(text, chat_id)
+                continue
+
+            # Confirmation en attente (OUI/NON)
+            if chat_id in pending_confirmations:
+                handle_confirmation(text, chat_id)
+                continue
+
             action = BUTTON_MAP.get(text.lower())
             if action:
                 handle_action(action, chat_id)
             else:
                 send_message(f"❓ Non reconnu : `{text}`\nUtilise les boutons ou ⚙️ Aide.", chat_id)
+
         time.sleep(1)
 
 
