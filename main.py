@@ -37,7 +37,9 @@ KEYBOARD = {
     "keyboard": [
         ["▶️ Démarrer", "⏸ Pause"],
         ["⏹ Arrêter",  "📊 Statut"],
-        ["📋 Trades",   "⚙️ Aide"],
+        ["📋 Trades",   "🔍 Debug"],
+        ["❌ Fermer",   "💣 Tout fermer"],
+        ["⚙️ Aide"],
     ],
     "resize_keyboard": True,
     "persistent":      True,
@@ -49,6 +51,9 @@ BUTTON_MAP = {
     "⏹ arrêter":   "stop",
     "📊 statut":    "status",
     "📋 trades":    "positions",
+    "🔍 debug":     "debug_prompt",
+    "❌ fermer":    "close_prompt",
+    "💣 tout fermer": "closeall_prompt",
     "⚙️ aide":      "help",
     "/start":      "start",
     "/stop":       "stop",
@@ -57,6 +62,9 @@ BUTTON_MAP = {
     "/positions":  "positions",
     "/help":       "help",
 }
+
+# États conversationnels : chat_id → {"waiting": "debug"|"close"}
+waiting_input: dict = {}
 
 # Confirmations en attente : chat_id → {"action": "close"|"closeall", "symbol": str|None}
 pending_confirmations: dict = {}
@@ -101,11 +109,12 @@ def get_updates(offset: int = 0):
         return []
 
 
-# ── Statut (/statut) ──────────────────────────────────────────────────────────
+# ── Statut (/statut) — avec métriques ────────────────────────────────────────
 def build_status() -> str:
     if not strategy:
         return "🔴 Bot arrêté."
     stats     = strategy.get_stats()
+    metrics   = strategy.get_metrics()
     positions = strategy.get_positions()
     state     = "⏸ En pause" if bot_paused else "🟢 Actif"
 
@@ -115,12 +124,29 @@ def build_status() -> str:
         f"🔢 Trades : {stats['total_trades']} (✅ {stats['wins']} / ❌ {stats['losses']})",
     ]
 
+    # Métriques (affichées uniquement si on a au moins 3 trades)
+    if stats["total_trades"] >= 3:
+        pf_str = (f"{metrics['profit_factor']:.2f}"
+                  if metrics["profit_factor"] != float("inf") else "∞")
+        lines.append(
+            f"\n📐 *Métriques :*\n"
+            f"  Winrate : `{metrics['winrate']:.1f}%` | Profit Factor : `{pf_str}`\n"
+            f"  Expectancy : `{metrics['expectancy']:+.4f}` USDC/trade\n"
+            f"  Max Drawdown : `{metrics['max_drawdown']:.2f}` USDC | Sharpe : `{metrics['sharpe']:.2f}`"
+        )
+
     if positions:
         lines.append(f"\n📌 *Positions ouvertes :*")
         for p in positions:
-            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
+            tp_status = ""
+            if p["tp1_done"] and p["tp2_done"]:
+                tp_status = " | TP1✅ TP2✅"
+            elif p["tp1_done"]:
+                tp_status = " | TP1✅"
             lines.append(
-                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
+                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_usdc']:+.2f}` USDC "
+                f"(`{p['pnl_pct']:+.2f}%`){tp_status}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -146,9 +172,15 @@ def build_recap() -> str:
     if positions:
         lines.append(f"\n📌 *{len(positions)} position(s) :*")
         for p in positions:
-            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
+            tp_tag    = ""
+            if p["tp1_done"] and p["tp2_done"]:
+                tp_tag = " TP1✅TP2✅"
+            elif p["tp1_done"]:
+                tp_tag = " TP1✅"
             lines.append(
-                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | 💵 Gain : `{p['ts_pnl']:+.2f}` USDC"
+                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | "
+                f"💵 Gain : `{p['ts_pnl']:+.2f}` USDC{tp_tag}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -167,11 +199,14 @@ def build_trades() -> str:
     lines = ["📋 *Positions ouvertes :*\n"]
     for p in positions:
         gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+        tp1_tag  = "✅" if p["tp1_done"] else "⏳"
+        tp2_tag  = "✅" if p["tp2_done"] else "⏳"
         lines.append(
             f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
-            f"  Investi : `{p['size_usdc']:.2f}` USDC\n"
+            f"  Investi : `{p['size_usdc_initial']:.2f}` USDC (restant : `{p['size_usdc']:.2f}` USDC)\n"
             f"  Entrée : `{p['entry']:.6f}` → Actuel : `{p['current']:.6f}`\n"
-            f"  TS à : `{p['ts_price']:.6f}` | 💵 Résultat min si TS : `{p['ts_pnl']:+.2f}` USDC (`{p['ts_pct']:+.2f}%`)\n"
+            f"  TP1 {tp1_tag} `{p['tp1_price']:.6f}` | TP2 {tp2_tag} `{p['tp2_price']:.6f}`\n"
+            f"  TS : `{p['ts_price']:.6f}` | 💵 Min si TS : `{p['ts_pnl']:+.2f}` USDC (`{p['ts_pct']:+.2f}%`)\n"
         )
     return "\n".join(lines)
 
@@ -196,23 +231,159 @@ def check_midnight_reset():
             strategy.reset_daily_pnl()
 
 
+# ── Clôture manuelle avec confirmation ────────────────────────────────────────
+def handle_close(text: str, chat_id: str):
+    if not strategy:
+        send_message("ℹ️ Aucune stratégie active.", chat_id)
+        return
+
+    if text.strip().upper() == "/CLOSEALL":
+        positions = strategy.get_positions()
+        if not positions:
+            send_message("📭 Aucune position ouverte.", chat_id)
+            return
+        symbols = ", ".join([f"`{p['symbol']}`" for p in positions])
+        pending_confirmations[chat_id] = {"action": "closeall", "symbol": None}
+        send_message(
+            f"⚠️ *Confirmation requise*\n\n"
+            f"Fermer *toutes les positions* : {symbols} ?\n\n"
+            f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
+            chat_id,
+        )
+        return
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        send_message("Usage : `/close SYMBOL`\nEx : `/close GMX` ou `/close GMX/USDC`", chat_id)
+        return
+
+    symbol = parts[1].upper()
+    if "/" not in symbol:
+        symbol = symbol + "/USDC"
+
+    if symbol not in strategy.positions:
+        send_message(f"❓ Aucune position ouverte sur `{symbol}`.", chat_id)
+        return
+
+    pos = strategy.positions[symbol]
+    try:
+        price = float(strategy.exchange.fetch_ticker(symbol)["last"])
+        pnl_u, pnl_p = strategy._calc_pnl(pos["size_usdc"], pos["entry"], price)
+        prix_str = (f"Prix actuel : `{price:.6f}` | "
+                    f"G/P estimé : `{pnl_u:+.2f}` USDC (`{pnl_p:+.2f}%`)")
+    except Exception:
+        prix_str = "Prix actuel indisponible"
+
+    pending_confirmations[chat_id] = {"action": "close", "symbol": symbol}
+    send_message(
+        f"⚠️ *Confirmation requise*\n\nFermer `{symbol}` ?\n{prix_str}\n\n"
+        f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
+        chat_id,
+    )
+
+
+def handle_confirmation(text: str, chat_id: str):
+    pending  = pending_confirmations.get(chat_id)
+    if not pending:
+        return
+    response = text.strip().upper()
+    if response == "NON":
+        del pending_confirmations[chat_id]
+        send_message("❎ Annulé.", chat_id)
+        return
+    if response == "OUI":
+        del pending_confirmations[chat_id]
+        if not strategy:
+            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            return
+        if pending["action"] == "close":
+            send_message(strategy.close_position_manual(pending["symbol"]), chat_id)
+        elif pending["action"] == "closeall":
+            msgs = strategy.close_all_manual()
+            for msg in msgs:
+                send_message(msg, chat_id)
+            if not msgs:
+                send_message("📭 Aucune position à fermer.", chat_id)
+        return
+    send_message("Réponds *OUI* pour confirmer ou *NON* pour annuler.", chat_id)
+
+
+# ── Réponse aux demandes de symbole ──────────────────────────────────────────
+def handle_waiting_input(text: str, chat_id: str):
+    state = waiting_input.pop(chat_id, None)
+    if not state:
+        return
+    symbol = text.strip().upper()
+    if "/" not in symbol:
+        symbol = symbol + "/USDC"
+
+    if state["waiting"] == "debug":
+        if not strategy:
+            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            return
+        send_message(strategy.debug_position(symbol), chat_id)
+
+    elif state["waiting"] == "close":
+        handle_close(f"/close {symbol}", chat_id)
+
+
 # ── Actions boutons / commandes ───────────────────────────────────────────────
 def handle_action(action: str, chat_id: str, raw_text: str = ""):
     global bot_running, bot_paused, strategy
 
-    # ── /debug SYMBOL ─────────────────────────────────────────────────────────
     if action == "debug":
         if not strategy:
             send_message("ℹ️ Aucune stratégie active.", chat_id)
             return
         parts = raw_text.strip().split()
         if len(parts) < 2:
-            send_message("Usage : `/debug SYMBOL`\nEx : `/debug BTC/USDC`", chat_id)
+            send_message("Usage : `/debug SYMBOL`\nEx : `/debug ETH/USDC`", chat_id)
             return
         symbol = parts[1].upper()
         if "/" not in symbol:
             symbol = symbol + "/USDC"
         send_message(strategy.debug_position(symbol), chat_id)
+        return
+
+    if action == "debug_prompt":
+        if not strategy:
+            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            return
+        positions = strategy.get_positions()
+        if not positions:
+            send_message("📭 Aucune position ouverte à diagnostiquer.", chat_id)
+            return
+        symbols = "\n".join([f"• `{p['symbol']}`" for p in positions])
+        waiting_input[chat_id] = {"waiting": "debug"}
+        send_message(
+            f"🔍 *Debug — quelle paire ?*\n\nPositions ouvertes :\n{symbols}\n\n"
+            f"Envoie le symbole (ex: `ETH` ou `ETH/USDC`)",
+            chat_id,
+        )
+        return
+
+    if action == "close_prompt":
+        if not strategy:
+            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            return
+        positions = strategy.get_positions()
+        if not positions:
+            send_message("📭 Aucune position ouverte à fermer.", chat_id)
+            return
+        symbols = "\n".join([
+            f"• `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%`"
+            for p in positions
+        ])
+        waiting_input[chat_id] = {"waiting": "close"}
+        send_message(
+            f"❌ *Fermer — quelle paire ?*\n\nPositions ouvertes :\n{symbols}\n\n"
+            f"Envoie le symbole (ex: `ETH` ou `ETH/USDC`)",
+            chat_id,
+        )
+        return
+
+    if action == "closeall_prompt":
+        handle_close("/closeall", chat_id)
         return
 
     if action == "start":
@@ -231,7 +402,10 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
         threading.Thread(target=trading_loop, daemon=True).start()
         send_message(
             f"✅ *Bot démarré* — Mode PAPER\n"
-            f"💰 Capital : 100 USDC | SL -2% | TS -2% | RSI < 65 | Volume ×2 | Filtre 4h\n"
+            f"💰 Capital : 100 USDC | 5 positions max\n"
+            f"📐 ATR dynamique | SL ×2.5 ATR | TS ×3.0 ATR\n"
+            f"🎯 TP1 +2×ATR (30%) | TP2 +4×ATR (30%) | Reste TS\n"
+            f"🔍 Filtres : liquidité 50M | spread | BTC régime | RSI 50–85 | pente EMA\n"
             f"🕐 Récaps : {RECAP_START_HOUR}h–{RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
             chat_id,
         )
@@ -244,7 +418,7 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
             send_message("ℹ️ Déjà en pause.", chat_id)
             return
         bot_paused = True
-        send_message("⏸ *Pause* — stops toujours actifs.", chat_id)
+        send_message("⏸ *Pause* — stops et TP toujours actifs.", chat_id)
 
     elif action == "stop":
         if not bot_running:
@@ -264,17 +438,17 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
         send_message(
             "⚙️ *Aide*\n\n"
             "▶️ Démarrer — Lancer / reprendre\n"
-            "⏸ Pause — Suspendre _(stops actifs)_\n"
+            "⏸ Pause — Suspendre _(stops et TP actifs)_\n"
             "⏹ Arrêter — Arrêt complet\n"
-            "📊 Statut — Capital et positions\n"
+            "📊 Statut — Capital, positions, métriques\n"
             "📋 Trades — Détail des positions ouvertes\n"
             "⚙️ Aide — Cette aide\n"
             "`/debug SYMBOL` — Diagnostiquer une position\n"
-            "`/close SYMBOL` — Fermer une position manuellement\n"
+            "`/close SYMBOL` — Fermer une position\n"
             "`/closeall` — Fermer toutes les positions\n\n"
-            "_Signal : EMA20>50 sur 1h ET 4h | Volume ×2 | RSI < 65_\n"
-            "_SL : -2% | TS : -2% depuis le plus haut_\n"
-            "_Analyse matin 7h : tendance 1h+4h, fermeture auto si invalide_",
+            "_Signal : EMA20>50 (1h+4h) | Pente EMA | Volume ×2 | RSI 50–85_\n"
+            "_Filtres : liquidité 50M | spread 0.15% | BTC > EMA200_\n"
+            "_Stops ATR : SL ×2.5 | TS ×3.0 | TP1 +2×ATR | TP2 +4×ATR_",
             chat_id,
         )
 
@@ -291,7 +465,7 @@ def trading_loop():
                 for msg in strategy.morning_analysis():
                     send_message(msg)
 
-            # Scan toujours actif (stops vérifiés même en pause)
+            # Scan toujours actif (stops et TP vérifiés même en pause)
             alerts = strategy.scan()
             for alert in alerts:
                 send_message(alert)
@@ -310,7 +484,7 @@ def trading_loop():
     log.info("Boucle arrêtée")
 
 
-# ── Boucle Telegram ───────────────────────────────────────────────────────────
+# ── Boucle Telegram (long polling) ───────────────────────────────────────────
 def telegram_loop():
     global last_update_id
     log.info("Écoute Telegram démarrée")
@@ -325,19 +499,21 @@ def telegram_loop():
             if not text:
                 continue
 
-            # Commande /debug (avec argument)
             if text.lower().startswith("/debug"):
                 handle_action("debug", chat_id, raw_text=text)
                 continue
 
-            # Commandes /close et /closeall
             if text.lower().startswith("/close"):
                 handle_close(text, chat_id)
                 continue
 
-            # Confirmation en attente (OUI/NON)
             if chat_id in pending_confirmations:
                 handle_confirmation(text, chat_id)
+                continue
+
+            # Réponse à une demande de symbole (debug ou close)
+            if chat_id in waiting_input:
+                handle_waiting_input(text, chat_id)
                 continue
 
             action = BUTTON_MAP.get(text.lower())
