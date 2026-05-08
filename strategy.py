@@ -33,10 +33,10 @@ TP2_RATIO           = 0.30       # % de la position vendue au TP2
 # Le reste (40%) reste en trailing stop
 
 # Filtres d'entrée
-RSI_MIN_ENTRY       = 50         # RSI minimum (évite les marchés mous)
+RSI_MIN_ENTRY       = 45         # RSI minimum (évite les marchés mous)
 RSI_MAX_ENTRY       = 85         # RSI maximum (évite surachat extrême)
-VOLUME_MULTIPLIER   = 2.0        # Volume min vs moyenne 20 périodes
-MIN_VOLUME_24H_USDC = 50_000_000 # Volume 24h minimum en USDC (liquidité)
+VOLUME_MULTIPLIER   = 1.8        # Volume min vs moyenne 20 périodes
+MIN_VOLUME_24H_USDC = 10_000_000 # Volume 24h minimum en USDC (liquidité)
 MAX_SPREAD_PCT      = 0.15       # Spread max bid/ask en %
 EMA_SLOPE_MIN       = 0.0        # Pente EMA20 minimale (>0 = haussière)
 
