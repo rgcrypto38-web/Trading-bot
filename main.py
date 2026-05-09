@@ -138,15 +138,19 @@ def build_status() -> str:
     if positions:
         lines.append(f"\n📌 *Positions ouvertes :*")
         for p in positions:
-            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
-            tp_status = ""
+            gp_emoji   = "📈" if p["pnl_pct"] >= 0 else "📉"
+            secured    = p.get("secured_pnl_usdc", 0.0)
+            total_gp   = p["pnl_usdc"] + secured
+            tp_tag     = ""
             if p["tp1_done"] and p["tp2_done"]:
-                tp_status = " | TP1✅ TP2✅"
+                tp_tag = " TP1✅TP2✅"
             elif p["tp1_done"]:
-                tp_status = " | TP1✅"
+                tp_tag = " TP1✅"
+            sec_str    = f" | Sécurisé : `{secured:+.2f}` USDC" if secured != 0 else ""
             lines.append(
-                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_usdc']:+.2f}` USDC "
-                f"(`{p['pnl_pct']:+.2f}%`){tp_status}"
+                f"{gp_emoji} `{p['symbol']}` | "
+                f"G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
+                f"{sec_str}{tp_tag}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -172,15 +176,18 @@ def build_recap() -> str:
     if positions:
         lines.append(f"\n📌 *{len(positions)} position(s) :*")
         for p in positions:
-            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
-            tp_tag    = ""
+            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
+            secured  = p.get("secured_pnl_usdc", 0.0)
+            tp_tag   = ""
             if p["tp1_done"] and p["tp2_done"]:
                 tp_tag = " TP1✅TP2✅"
             elif p["tp1_done"]:
                 tp_tag = " TP1✅"
+            sec_str  = f" | Sécurisé : `{secured:+.2f}` USDC" if secured != 0 else ""
             lines.append(
-                f"{gp_emoji} `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%` | "
-                f"💵 Gain : `{p['ts_pnl']:+.2f}` USDC{tp_tag}"
+                f"{gp_emoji} `{p['symbol']}` | "
+                f"G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
+                f"{sec_str}{tp_tag}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -529,3 +536,4 @@ def telegram_loop():
 if __name__ == "__main__":
     log.info("Démarrage")
     telegram_loop()
+    
