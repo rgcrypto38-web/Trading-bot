@@ -545,10 +545,11 @@ class TradingStrategy:
             sell_usdc   = pos["size_usdc_initial"] * sell_ratio
             sell_usdc   = min(sell_usdc, pos["size_usdc"])  # ne pas vendre plus que dispo
             pnl_u, pnl_p = self._calc_pnl(sell_usdc, pos["entry"], current_price)
-            pos["size_usdc"] -= sell_usdc
-            self.capital     += sell_usdc + pnl_u
-            self.pnl         += pnl_u
-            pos["tp1_done"]   = True
+            pos["size_usdc"]      -= sell_usdc
+            self.capital          += sell_usdc + pnl_u
+            self.pnl              += pnl_u
+            pos["tp1_done"]        = True
+            pos["secured_pnl_usdc"] = pos.get("secured_pnl_usdc", 0.0) + pnl_u
             self.total_pnl_history.append([round(pnl_u, 4), round(pnl_p, 4)])
             self._save_state()
             log.info(f"[TP1] {symbol} @ {current_price:.6f} | +{pnl_u:.2f} USDC")
@@ -565,10 +566,11 @@ class TradingStrategy:
             sell_usdc   = pos["size_usdc_initial"] * sell_ratio
             sell_usdc   = min(sell_usdc, pos["size_usdc"])
             pnl_u, pnl_p = self._calc_pnl(sell_usdc, pos["entry"], current_price)
-            pos["size_usdc"] -= sell_usdc
-            self.capital     += sell_usdc + pnl_u
-            self.pnl         += pnl_u
-            pos["tp2_done"]   = True
+            pos["size_usdc"]      -= sell_usdc
+            self.capital          += sell_usdc + pnl_u
+            self.pnl              += pnl_u
+            pos["tp2_done"]        = True
+            pos["secured_pnl_usdc"] = pos.get("secured_pnl_usdc", 0.0) + pnl_u
             self.total_pnl_history.append([round(pnl_u, 4), round(pnl_p, 4)])
             self._save_state()
             log.info(f"[TP2] {symbol} @ {current_price:.6f} | +{pnl_u:.2f} USDC")
@@ -826,21 +828,22 @@ class TradingStrategy:
                           if pos.get("opened_at") else "—")
 
             result.append({
-                "symbol":           symbol,
-                "entry":            pos["entry"],
-                "current":          price,
-                "size_usdc":        pos["size_usdc"],
+                "symbol":            symbol,
+                "entry":             pos["entry"],
+                "current":           price,
+                "size_usdc":         pos["size_usdc"],
                 "size_usdc_initial": pos.get("size_usdc_initial", pos["size_usdc"]),
-                "highest":          pos["highest"],
-                "ts_price":         pos["trailing_stop"],
-                "tp1_price":        pos.get("tp1_price", 0),
-                "tp2_price":        pos.get("tp2_price", 0),
-                "tp1_done":         pos.get("tp1_done", False),
-                "tp2_done":         pos.get("tp2_done", False),
-                "pnl_usdc":         pnl_usdc,
-                "pnl_pct":          pnl_pct,
-                "ts_pnl":           ts_pnl,
-                "ts_pct":           ts_pct,
-                "opened_at":        opened_fmt,
+                "highest":           pos["highest"],
+                "ts_price":          pos["trailing_stop"],
+                "tp1_price":         pos.get("tp1_price", 0),
+                "tp2_price":         pos.get("tp2_price", 0),
+                "tp1_done":          pos.get("tp1_done", False),
+                "tp2_done":          pos.get("tp2_done", False),
+                "pnl_usdc":          pnl_usdc,
+                "pnl_pct":           pnl_pct,
+                "ts_pnl":            ts_pnl,
+                "ts_pct":            ts_pct,
+                "secured_pnl_usdc":  pos.get("secured_pnl_usdc", 0.0),
+                "opened_at":         opened_fmt,
             })
         return result
