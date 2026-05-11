@@ -26,11 +26,11 @@ TS_MIN_PCT          = 2.0        # Garde-fou plancher TS (%)
 TS_MAX_PCT          = 10.0       # Garde-fou plafond TS (%)
 
 # Take profit partiels
-TP1_ATR_MULT        = 2.0        # TP1 = entrée + ATR × ce multiplicateur
-TP2_ATR_MULT        = 4.0        # TP2 = entrée + ATR × ce multiplicateur
-TP1_RATIO           = 0.30       # % de la position vendue au TP1
-TP2_RATIO           = 0.30       # % de la position vendue au TP2
-# Le reste (40%) reste en trailing stop
+TP1_ATR_MULT        = 3.0        # TP1 = entrée + ATR × ce multiplicateur
+TP2_ATR_MULT        = 5.0        # TP2 = entrée + ATR × ce multiplicateur
+TP1_RATIO           = 0.25       # % de la position vendue au TP1
+TP2_RATIO           = 0.25       # % de la position vendue au TP2
+# Le reste (50%) reste en trailing stop
 
 # Filtres d'entrée
 RSI_MIN_ENTRY       = 45         # RSI minimum (évite les marchés mous)
@@ -137,7 +137,8 @@ class TradingStrategy:
         slots_libres = MAX_POSITIONS - len(self.positions)
         if slots_libres <= 0:
             return 0.0
-        taille = self.capital / slots_libres
+        plafond = (CAPITAL_TOTAL / MAX_POSITIONS) * 1.20  # ex : 20 × 1.20 = 24 USDC
+        taille  = min(self.capital / slots_libres, plafond)
         return taille if taille >= POSITION_SIZE_MIN else 0.0
 
     # ── Formule G/P unifiée ───────────────────────────────────────────────────
@@ -355,6 +356,12 @@ class TradingStrategy:
         slope      = self._ema_slope(df1["close"])
         slope_ok   = slope > EMA_SLOPE_MIN
         atr_val    = self._atr(df1)
+
+        # ── Filtre stablecoin : ATR relatif < 0.10% → actif quasi-immobile ──
+        atr_pct_rel = (atr_val / float(last1["close"])) * 100 if float(last1["close"]) > 0 else 0
+        if atr_pct_rel < 0.10:
+            result["details"] = f"❌ ATR relatif trop faible ({atr_pct_rel:.4f}%) — stablecoin ou actif immobile"
+            return result
 
         # ── Données 4h ────────────────────────────────────────────────────────
         df4 = self._fetch_ohlcv(symbol, TIMEFRAME_LONG)
@@ -608,14 +615,39 @@ class TradingStrategy:
         opened_fmt = datetime.fromisoformat(opened_at).strftime("%d/%m %H:%M") if opened_at else "—"
         closed_fmt = datetime.fromisoformat(closed_at).strftime("%d/%m %H:%M")
 
+        size_initial  = pos.get("size_usdc_initial", pos["size_usdc"])
+        secured       = pos.get("secured_pnl_usdc", 0.0)
+        total_pnl     = pnl_usdc + secured
+        total_pct     = (total_pnl / size_initial * 100) if size_initial > 0 else 0.0
+
+        # Reconstruction des gains TP1 / TP2 depuis secured et ratios
+        tp1_done = pos.get("tp1_done", False)
+        tp2_done = pos.get("tp2_done", False)
+        tp1_sell = size_initial * TP1_RATIO
+        tp2_sell = size_initial * TP2_RATIO
+
+        tp_lines = ""
+        if tp1_done:
+            tp1_pnl_u, tp1_pnl_p = self._calc_pnl(tp1_sell, pos["entry"], pos.get("tp1_price", pos["entry"]))
+            tp1_base_pct = (tp1_pnl_u / size_initial * 100) if size_initial > 0 else 0.0
+            tp_lines += f"Gain TP1 : `{tp1_pnl_u:+.2f}` USDC (`{tp1_base_pct:+.2f}%` sur `{size_initial:.2f}` USDC)\n"
+        if tp2_done:
+            size_after_tp1 = size_initial - tp1_sell
+            tp2_pnl_u, tp2_pnl_p = self._calc_pnl(tp2_sell, pos["entry"], pos.get("tp2_price", pos["entry"]))
+            tp2_base_pct = (tp2_pnl_u / size_after_tp1 * 100) if size_after_tp1 > 0 else 0.0
+            tp_lines += f"Gain TP2 : `{tp2_pnl_u:+.2f}` USDC (`{tp2_base_pct:+.2f}%` sur `{size_after_tp1:.2f}` USDC)\n"
+
         log.info(f"[PAPER] CLÔTURE {symbol} @ {price:.6f} | "
                  f"G/P : {pnl_usdc:+.2f} USDC ({pnl_pct:+.2f}%) | {reason}")
         return (
             f"❌ *Clôture — {symbol}* — {reason}\n"
             f"Ouvert {opened_fmt} → Clôturé {closed_fmt}\n"
             f"Entrée : `{pos['entry']:.6f}` | Sortie : `{price:.6f}`\n"
-            f"Investi initial : `{pos['size_usdc_initial']:.2f}` USDC\n"
-            f"G/P clôture : `{pnl_usdc:+.2f}` USDC (`{pnl_pct:+.2f}%`)"
+            f"Investi initial : `{size_initial:.2f}` USDC\n"
+            f"{tp_lines}"
+            f"G/P clôture : `{pnl_usdc:+.2f}` USDC (`{pnl_pct:+.2f}%`)\n"
+            f"{'━' * 20}\n"
+            f"Total : `{total_pnl:+.2f}` USDC (`{total_pct:+.2f}%` sur `{size_initial:.2f}` USDC)"
         )
 
     # ── Clôture manuelle ──────────────────────────────────────────────────────
