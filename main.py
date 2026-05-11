@@ -140,17 +140,22 @@ def build_status() -> str:
         for p in positions:
             gp_emoji   = "📈" if p["pnl_pct"] >= 0 else "📉"
             secured    = p.get("secured_pnl_usdc", 0.0)
-            total_gp   = p["pnl_usdc"] + secured
+            flottant   = p["pnl_usdc"]
+            total_gp   = flottant + secured
+            size_init  = p.get("size_usdc_initial", p["size_usdc"])
+            total_pct  = (total_gp / size_init * 100) if size_init > 0 else 0.0
+            tp1_g      = secured if p["tp1_done"] and not p["tp2_done"] else (secured / 2 if p["tp2_done"] else 0.0)
+            tp2_g      = secured / 2 if p["tp2_done"] else 0.0
             tp_tag     = ""
             if p["tp1_done"] and p["tp2_done"]:
                 tp_tag = " TP1✅TP2✅"
             elif p["tp1_done"]:
                 tp_tag = " TP1✅"
-            sec_str    = f" | Sécurisé : `{secured:+.2f}` USDC" if secured != 0 else ""
             lines.append(
                 f"{gp_emoji} `{p['symbol']}` | "
-                f"G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
-                f"{sec_str}{tp_tag}"
+                f"G/P : `{total_gp:+.2f}` USDC "
+                f"({tp1_g:+.2f} + {tp2_g:+.2f} + {flottant:+.2f}) → `{total_pct:+.2f}%`"
+                f"{tp_tag}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -176,18 +181,24 @@ def build_recap() -> str:
     if positions:
         lines.append(f"\n📌 *{len(positions)} position(s) :*")
         for p in positions:
-            gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
-            secured  = p.get("secured_pnl_usdc", 0.0)
-            tp_tag   = ""
+            gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
+            secured   = p.get("secured_pnl_usdc", 0.0)
+            flottant  = p["pnl_usdc"]
+            total_gp  = flottant + secured
+            size_init = p.get("size_usdc_initial", p["size_usdc"])
+            total_pct = (total_gp / size_init * 100) if size_init > 0 else 0.0
+            tp1_g     = secured if p["tp1_done"] and not p["tp2_done"] else (secured / 2 if p["tp2_done"] else 0.0)
+            tp2_g     = secured / 2 if p["tp2_done"] else 0.0
+            tp_tag    = ""
             if p["tp1_done"] and p["tp2_done"]:
                 tp_tag = " TP1✅TP2✅"
             elif p["tp1_done"]:
                 tp_tag = " TP1✅"
-            sec_str  = f" | Sécurisé : `{secured:+.2f}` USDC" if secured != 0 else ""
             lines.append(
                 f"{gp_emoji} `{p['symbol']}` | "
-                f"G/P : `{p['pnl_usdc']:+.2f}` USDC (`{p['pnl_pct']:+.2f}%`)"
-                f"{sec_str}{tp_tag}"
+                f"G/P : `{total_gp:+.2f}` USDC "
+                f"({tp1_g:+.2f} + {tp2_g:+.2f} + {flottant:+.2f}) → `{total_pct:+.2f}%`"
+                f"{tp_tag}"
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
@@ -205,15 +216,23 @@ def build_trades() -> str:
 
     lines = ["📋 *Positions ouvertes :*\n"]
     for p in positions:
-        gp_emoji = "📈" if p["pnl_pct"] >= 0 else "📉"
-        tp1_tag  = "✅" if p["tp1_done"] else "⏳"
-        tp2_tag  = "✅" if p["tp2_done"] else "⏳"
+        gp_emoji  = "📈" if p["pnl_pct"] >= 0 else "📉"
+        tp1_tag   = "✅" if p["tp1_done"] else "⏳"
+        tp2_tag   = "✅" if p["tp2_done"] else "⏳"
+        secured   = p.get("secured_pnl_usdc", 0.0)
+        flottant  = p["pnl_usdc"]
+        total_gp  = flottant + secured
+        size_init = p.get("size_usdc_initial", p["size_usdc"])
+        total_pct = (total_gp / size_init * 100) if size_init > 0 else 0.0
+        tp1_g     = secured if p["tp1_done"] and not p["tp2_done"] else (secured / 2 if p["tp2_done"] else 0.0)
+        tp2_g     = secured / 2 if p["tp2_done"] else 0.0
         lines.append(
             f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
-            f"  Investi : `{p['size_usdc_initial']:.2f}` USDC (restant : `{p['size_usdc']:.2f}` USDC)\n"
+            f"  Investi : `{size_init:.2f}` USDC (restant : `{p['size_usdc']:.2f}` USDC)\n"
             f"  Entrée : `{p['entry']:.6f}` → Actuel : `{p['current']:.6f}`\n"
             f"  TP1 {tp1_tag} `{p['tp1_price']:.6f}` | TP2 {tp2_tag} `{p['tp2_price']:.6f}`\n"
             f"  TS : `{p['ts_price']:.6f}` | 💵 Min si TS : `{p['ts_pnl']:+.2f}` USDC (`{p['ts_pct']:+.2f}%`)\n"
+            f"  G/P : `{total_gp:+.2f}` USDC ({tp1_g:+.2f} + {tp2_g:+.2f} + {flottant:+.2f}) → `{total_pct:+.2f}%`\n"
         )
     return "\n".join(lines)
 
@@ -411,7 +430,7 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
             f"✅ *Bot démarré* — Mode PAPER\n"
             f"💰 Capital : 100 USDC | 5 positions max\n"
             f"📐 ATR dynamique | SL ×2.5 ATR | TS ×3.0 ATR\n"
-            f"🎯 TP1 +2×ATR (30%) | TP2 +4×ATR (30%) | Reste TS\n"
+            f"🎯 TP1 +3×ATR (25%) | TP2 +5×ATR (25%) | Reste 50% TS\n"
             f"🔍 Filtres : liquidité 50M | spread | BTC régime | RSI 50–85 | pente EMA\n"
             f"🕐 Récaps : {RECAP_START_HOUR}h–{RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
             chat_id,
@@ -455,7 +474,7 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
             "`/closeall` — Fermer toutes les positions\n\n"
             "_Signal : EMA20>50 (1h+4h) | Pente EMA | Volume ×2 | RSI 50–85_\n"
             "_Filtres : liquidité 50M | spread 0.15% | BTC > EMA200_\n"
-            "_Stops ATR : SL ×2.5 | TS ×3.0 | TP1 +2×ATR | TP2 +4×ATR_",
+            "_Stops ATR : SL ×2.5 | TS ×3.0 | TP1 +3×ATR (25%) | TP2 +5×ATR (25%)_",
             chat_id,
         )
 
@@ -526,14 +545,4 @@ def telegram_loop():
             action = BUTTON_MAP.get(text.lower())
             if action:
                 handle_action(action, chat_id)
-            else:
-                send_message(f"❓ Non reconnu : `{text}`\nUtilise les boutons ou ⚙️ Aide.", chat_id)
-
-        time.sleep(1)
-
-
-# ── Point d'entrée ────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    log.info("Démarrage")
-    telegram_loop()
-    
+            
