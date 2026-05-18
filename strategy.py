@@ -703,8 +703,16 @@ class TradingStrategy:
             ts_pnl, ts_pct    = self._calc_ts_result(
                 pos["size_usdc"], pos["entry"], pos["highest"], atr_v
             )
-            verdict    = "✅ *Garder*" if analysis["valid"] else "❌ *Abandonner*"
             opened_fmt = datetime.fromisoformat(pos["opened_at"]).strftime("%d/%m %H:%M") if pos.get("opened_at") else "—"
+            days_open  = (datetime.utcnow() - datetime.fromisoformat(pos["opened_at"])).days if pos.get("opened_at") else 0
+            too_old    = days_open > 5 and not pos.get("tp1_done", False)
+            abandon    = not analysis["valid"] or too_old
+            if too_old and analysis["valid"]:
+                verdict = f"\u274c *Abandonner* \u2014 en range depuis {days_open}j sans TP1"
+            elif not analysis["valid"]:
+                verdict = "\u274c *Abandonner* \u2014 tendance invalide"
+            else:
+                verdict = "\u2705 *Garder*"
  
             tp_status = ""
             if pos.get("tp1_done") and pos.get("tp2_done"):
@@ -725,8 +733,11 @@ class TradingStrategy:
             )
             messages.append(msg)
  
-            if not analysis["valid"]:
-                close_msg = self._close_position(symbol, price, "Abandon matin — tendance invalide")
+            if abandon:
+                reason_close = (f"Abandon matin — en range depuis {days_open}j sans TP1"
+                                if too_old and analysis["valid"]
+                                else "Abandon matin — tendance invalide")
+                close_msg = self._close_position(symbol, price, reason_close)
                 if close_msg:
                     messages.append(close_msg)
  
