@@ -28,9 +28,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
  
 # ── Fuseau horaire ────────────────────────────────────────────────────────────
 PARIS_TZ         = timezone(timedelta(hours=2))  # UTC+2 été / hours=1 en hiver
-RECAP_START_HOUR = 7
-RECAP_END_HOUR   = 22
-MORNING_HOUR     = 7
+RECAP_START_HOUR   = 7
+RECAP_END_HOUR     = 22
+MORNING_HOUR       = 7
+DIAGNOSTIC_HOURS   = {8, 12, 18}  # heures de diagnostic si aucune position
  
 # ── Clavier Telegram ──────────────────────────────────────────────────────────
 KEYBOARD = {
@@ -240,12 +241,25 @@ def build_trades() -> str:
     return "\n".join(lines)
  
  
+last_diagnostic_hour = -1
+ 
+ 
 def should_send_recap() -> bool:
     global last_recap_hour
     now = datetime.now(PARIS_TZ)
     h   = now.hour
     if RECAP_START_HOUR <= h < RECAP_END_HOUR and h != last_recap_hour:
         last_recap_hour = h
+        return True
+    return False
+ 
+ 
+def should_send_diagnostic() -> bool:
+    global last_diagnostic_hour
+    now = datetime.now(PARIS_TZ)
+    h   = now.hour
+    if h in DIAGNOSTIC_HOURS and h != last_diagnostic_hour:
+        last_diagnostic_hour = h
         return True
     return False
  
@@ -499,10 +513,17 @@ def trading_loop():
             for alert in alerts:
                 send_message(alert)
  
-            if should_send_recap():
-                recap = build_recap()
-                if recap:
-                    send_message(recap)
+            positions = strategy.get_positions() if strategy else []
+            if positions:
+                # Positions ouvertes : récap horaire normal
+                if should_send_recap():
+                    recap = build_recap()
+                    if recap:
+                        send_message(recap)
+            else:
+                # Aucune position : diagnostic à 8h/12h/18h
+                if should_send_diagnostic() and strategy:
+                    send_message(strategy.scan_market_summary())
  
         except Exception as e:
             log.error(f"Erreur boucle : {e}")
