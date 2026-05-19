@@ -283,11 +283,11 @@ class TradingStrategy:
     # ── Filtre régime BTC ─────────────────────────────────────────────────────
     def _btc_regime_ok(self) -> bool:
         """
-        Retourne True si BTC > EMA200 sur 1h (régime haussier global).
+        Retourne True si BTC > EMA200 sur 4h (régime haussier global).
         En cas d'erreur API, retourne True pour ne pas bloquer le bot.
         """
         try:
-            df = self._fetch_ohlcv(BTC_SYMBOL, TIMEFRAME_SHORT, limit=220)
+            df = self._fetch_ohlcv(BTC_SYMBOL, TIMEFRAME_LONG, limit=220)
             if df is None or len(df) < BTC_EMA_PERIOD:
                 return True
             df["ema200"] = df["close"].ewm(span=BTC_EMA_PERIOD).mean()
