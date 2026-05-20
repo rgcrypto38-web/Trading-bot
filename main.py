@@ -82,8 +82,10 @@ strategy             = None
 last_update_id       = 0
 last_recap_hour      = -1
 last_diagnostic_hour = -1
+last_morning_hour    = -1   # track la dernière heure où morning_analysis a été lancée
 last_reset_date      = ""
 force_scan           = False   # déclenché par /boost
+_trading_thread      = None    # ref au thread trading_loop pour éviter les doublons
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -308,12 +310,16 @@ def should_send_diagnostic() -> bool:
 
 # ── Reset minuit ──────────────────────────────────────────────────────────────
 def check_midnight_reset():
-    global last_reset_date
+    global last_reset_date, last_morning_hour, last_recap_hour, last_diagnostic_hour
     today = datetime.now(PARIS_TZ).date().isoformat()
     if today != last_reset_date:
         last_reset_date = today
+        last_morning_hour    = -1  # réinitialiser pour le nouveau jour
+        last_recap_hour      = -1
+        last_diagnostic_hour = -1
         if strategy:
             strategy.reset_daily_pnl()
+            log.info("Reset journalier — counters d'heures réinitialisés")
 
 
 # ── Clôture manuelle avec confirmation ────────────────────────────────────────
@@ -514,6 +520,7 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
         return
 
     if action == "start":
+        global _trading_thread
         if bot_running and not bot_paused:
             send_message("⚠️ Le bot tourne déjà.", chat_id)
             return
@@ -521,18 +528,27 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
             bot_paused = False
             send_message("▶️ *Bot repris.*", chat_id)
             return
+        # Vérifier qu'aucun thread précédent ne tourne
+        if _trading_thread and _trading_thread.is_alive():
+            log.warning("Thread trading_loop précédent encore actif, attente...")
+            _trading_thread.join(timeout=5)
+            if _trading_thread.is_alive():
+                send_message("⚠️ Thread précédent encore actif. Attends 5s et relance.", chat_id)
+                return
         bot_running = True
         bot_paused  = False
         strategy    = TradingStrategy(binance_key=BINANCE_KEY, binance_secret=BINANCE_SECRET)
         nb_pos      = len(strategy.positions)
         recap       = f"\n📂 {nb_pos} position(s) rechargée(s)." if nb_pos > 0 else ""
-        threading.Thread(target=trading_loop, daemon=True).start()
+        _trading_thread = threading.Thread(target=trading_loop, daemon=True)
+        _trading_thread.start()
         send_message(
             f"✅ *Bot démarré* — Mode PAPER\n"
             f"💰 Capital : 100 USDC | 5 positions max\n"
-            f"📐 ATR dynamique | SL ×2.5 ATR | TS ×3.0 ATR\n"
+            f"📐 SL ×2.5 ATR | TS adaptatif ×2.0–×3.5 (selon volatilité)\n"
             f"🎯 TP1 +3×ATR (25%) | TP2 +5×ATR (25%) | Reste 50% TS\n"
-            f"🔍 Filtres : liquidité 10M | spread | BTC régime | RSI 45–85 | pente EMA\n"
+            f"🔍 Filtres : liquidité 10M | spread | BTC régime + bear mode | RSI 45–85 | pente EMA\n"
+            f"🔄 Re-entry cooldowns : SL 48h | Abandon 24h | TS+TP1 12h\n"
             f"🕐 Récaps : {RECAP_START_HOUR}h–{RECAP_END_HOUR}h | Analyse matin : {MORNING_HOUR}h{recap}",
             chat_id,
         )
@@ -548,11 +564,16 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
         send_message("⏸ *Pause* — stops et TP toujours actifs.", chat_id)
 
     elif action == "stop":
+        global _trading_thread
         if not bot_running:
             send_message("ℹ️ Le bot n'est pas en cours d'exécution.", chat_id)
             return
         bot_running = False
         bot_paused  = False
+        # Attendre que le thread se termine proprement
+        if _trading_thread and _trading_thread.is_alive():
+            log.info("Attente fermeture thread trading_loop...")
+            _trading_thread.join(timeout=10)
         send_message("⏹ *Bot arrêté.* Positions sauvegardées.", chat_id)
 
     elif action == "status":
@@ -599,15 +620,18 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
 
 
 # ── Boucle de trading ─────────────────────────────────────────────────────────
+# ── Boucle de trading ─────────────────────────────────────────────────────────
 def trading_loop():
-    global force_scan
+    global force_scan, last_morning_hour
     log.info("Boucle démarrée")
     while bot_running:
         try:
             check_midnight_reset()
 
             now_paris = datetime.now(PARIS_TZ)
-            if now_paris.hour == MORNING_HOUR and strategy:
+            # Morning analysis : trigger une seule fois à 7h (pas 60 fois de 7h00 à 7h59)
+            if now_paris.hour == MORNING_HOUR and now_paris.hour != last_morning_hour and strategy:
+                last_morning_hour = now_paris.hour
                 for msg in strategy.morning_analysis():
                     send_message(msg)
 
