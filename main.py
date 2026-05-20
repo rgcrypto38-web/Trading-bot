@@ -40,6 +40,7 @@ KEYBOARD = {
         ["⏹ Arrêter",  "📊 Statut"],
         ["📋 Trades",   "🔍 Debug"],
         ["❌ Fermer",   "💣 Tout fermer"],
+        ["📈 Stats",    "⚡ Boost"],
         ["⚙️ Aide"],
     ],
     "resize_keyboard": True,
@@ -55,6 +56,8 @@ BUTTON_MAP = {
     "🔍 debug":     "debug_prompt",
     "❌ fermer":    "close_prompt",
     "💣 tout fermer": "closeall_prompt",
+    "📈 stats":     "stats",
+    "⚡ boost":     "boost",
     "⚙️ aide":      "help",
     "/start":      "start",
     "/stop":       "stop",
@@ -62,6 +65,8 @@ BUTTON_MAP = {
     "/status":     "status",
     "/positions":  "positions",
     "/help":       "help",
+    "/stats":      "stats",
+    "/boost":      "boost",
 }
 
 # États conversationnels : chat_id → {"waiting": "debug"|"close"}
@@ -78,6 +83,7 @@ last_update_id       = 0
 last_recap_hour      = -1
 last_diagnostic_hour = -1
 last_reset_date      = ""
+force_scan           = False   # déclenché par /boost
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -161,6 +167,42 @@ def build_status() -> str:
             )
     else:
         lines.append("\n📭 Aucune position ouverte")
+
+    return "\n".join(lines)
+
+
+def build_stats() -> str:
+    """Statistiques détaillées : winrate, drawdown, sharpe, expectancy."""
+    if not strategy:
+        return "🔴 Bot arrêté."
+    stats   = strategy.get_stats()
+    metrics = strategy.get_metrics()
+    state   = "⏸ En pause" if bot_paused else "🟢 Actif"
+
+    lines = [
+        f"📈 *Statistiques* — {state}",
+        f"💼 Capital : `{stats['capital']:.2f}` USDC",
+        f"📊 G/P total : `{stats['pnl']:+.2f}` USDC | Aujourd'hui : `{stats['pnl_today']:+.2f}` USDC",
+        f"🔢 Trades : {stats['total_trades']} (✅ {stats['wins']} / ❌ {stats['losses']})",
+    ]
+    if stats["total_trades"] >= 3:
+        pf_str = (f"{metrics['profit_factor']:.2f}"
+                  if metrics["profit_factor"] != float("inf") else "∞")
+        lines += [
+            f"\n📐 *Métriques :*",
+            f"  Winrate : `{metrics['winrate']:.1f}%`",
+            f"  Profit Factor : `{pf_str}`",
+            f"  Expectancy : `{metrics['expectancy']:+.4f}` USDC/trade",
+            f"  Max Drawdown : `{metrics['max_drawdown']:.2f}` USDC",
+            f"  Sharpe : `{metrics['sharpe']:.2f}`",
+        ]
+    else:
+        lines.append(f"\n_Métriques disponibles à partir de 3 trades fermés._")
+
+    # Cooldowns actifs
+    if strategy:
+        cd_status = strategy.get_cooldowns_status()
+        lines.append(f"\n🔄 *Cooldowns :*\n{cd_status}")
 
     return "\n".join(lines)
 
@@ -347,6 +389,9 @@ def handle_confirmation(text: str, chat_id: str):
                 send_message(msg, chat_id)
             if not msgs:
                 send_message("📭 Aucune position à fermer.", chat_id)
+        elif pending["action"] == "buy":
+            msg = strategy.open_position_manual(pending["symbol"])
+            send_message(msg if msg else "⚠️ Entrée impossible.", chat_id)
         return
     send_message("Réponds *OUI* pour confirmer ou *NON* pour annuler.", chat_id)
 
@@ -368,6 +413,45 @@ def handle_waiting_input(text: str, chat_id: str):
 
     elif state["waiting"] == "close":
         handle_close(f"/close {symbol}", chat_id)
+
+
+def handle_buy(text: str, chat_id: str):
+    """Force l'achat d'une paire avec confirmation."""
+    if not strategy:
+        send_message("ℹ️ Aucune stratégie active.", chat_id)
+        return
+    parts = text.strip().split()
+    if len(parts) < 2:
+        send_message(
+            "Usage : `/buy SYMBOL`\nEx : `/buy SOL` ou `/buy SOL/USDC`\n"
+            "⚠️ Tous les filtres seront ignorés.", chat_id)
+        return
+    symbol = parts[1].upper()
+    if "/" not in symbol:
+        symbol = symbol + "/USDC"
+    pending_confirmations[chat_id] = {"action": "buy", "symbol": symbol}
+    send_message(
+        f"⚠️ *Confirmation achat forcé*\n\n"
+        f"Entrée manuelle sur `{symbol}` ?\n"
+        f"_Tous les filtres seront ignorés. SL/TS/TP normaux appliqués._\n\n"
+        f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
+        chat_id,
+    )
+
+
+def handle_skip(text: str, chat_id: str):
+    """Blacklist manuelle d'une paire 24h."""
+    if not strategy:
+        send_message("ℹ️ Aucune stratégie active.", chat_id)
+        return
+    parts = text.strip().split()
+    if len(parts) < 2:
+        send_message("Usage : `/skip SYMBOL`\nEx : `/skip SOL` ou `/skip SOL/USDC`", chat_id)
+        return
+    symbol = parts[1].upper()
+    if "/" not in symbol:
+        symbol = symbol + "/USDC"
+    send_message(strategy.skip_symbol(symbol), chat_id)
 
 
 # ── Actions boutons / commandes ───────────────────────────────────────────────
@@ -477,6 +561,17 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
     elif action == "positions":
         send_message(build_trades(), chat_id)
 
+    elif action == "stats":
+        send_message(build_stats(), chat_id)
+
+    elif action == "boost":
+        global force_scan
+        if not bot_running:
+            send_message("ℹ️ Le bot n'est pas démarré.", chat_id)
+            return
+        force_scan = True
+        send_message("⚡ *Scan forcé* — le bot scanne dans les prochaines secondes.", chat_id)
+
     elif action == "help":
         send_message(
             "⚙️ *Aide*\n\n"
@@ -485,19 +580,27 @@ def handle_action(action: str, chat_id: str, raw_text: str = ""):
             "⏹ Arrêter — Arrêt complet\n"
             "📊 Statut — Capital, positions, métriques\n"
             "📋 Trades — Détail des positions ouvertes\n"
-            "⚙️ Aide — Cette aide\n"
+            "📈 Stats — Winrate, drawdown, sharpe, cooldowns\n"
+            "⚡ Boost — Forcer un scan immédiat\n"
+            "⚙️ Aide — Cette aide\n\n"
             "`/debug SYMBOL` — Diagnostiquer une position\n"
             "`/close SYMBOL` — Fermer une position\n"
-            "`/closeall` — Fermer toutes les positions\n\n"
+            "`/closeall` — Fermer toutes les positions\n"
+            "`/buy SYMBOL` — Forcer entrée manuelle ⚠️\n"
+            "`/skip SYMBOL` — Blacklister une paire 24h\n"
+            "`/stats` — Statistiques détaillées\n"
+            "`/boost` — Scan immédiat\n\n"
             "_Signal : EMA20>50 (1h+4h) | Pente EMA | Volume ×2 | RSI 45–85_\n"
-            "_Filtres : liquidité 10M | spread 0.15% | BTC > EMA200_\n"
-            "_Stops ATR : SL ×2.5 | TS ×3.0 | TP1 +3×ATR (25%) | TP2 +5×ATR (25%)_",
+            "_Bear mode : Volume ×3 | RSI 55–85 (filtres resserrés)_\n"
+            "_Filtres : liquidité 10M | spread 0.15% | BTC > EMA200 4h_\n"
+            "_Stops ATR : SL ×2.5 | TS adaptatif ×2.0–×3.5 | TP1 +3×ATR (25%) | TP2 +5×ATR (25%)_",
             chat_id,
         )
 
 
 # ── Boucle de trading ─────────────────────────────────────────────────────────
 def trading_loop():
+    global force_scan
     log.info("Boucle démarrée")
     while bot_running:
         try:
@@ -509,19 +612,22 @@ def trading_loop():
                     send_message(msg)
 
             # Scan toujours actif (stops et TP vérifiés même en pause)
+            # Force scan si /boost demandé
+            if force_scan:
+                force_scan = False
+                log.info("Scan forcé via /boost")
+
             alerts = strategy.scan()
             for alert in alerts:
                 send_message(alert)
 
             positions = strategy.get_positions() if strategy else []
             if positions:
-                # Positions ouvertes : récap horaire normal
                 if should_send_recap():
                     recap = build_recap()
                     if recap:
                         send_message(recap)
             else:
-                # Aucune position : diagnostic à 8h/12h/18h
                 if should_send_diagnostic() and strategy:
                     send_message(strategy.scan_market_summary())
 
@@ -529,7 +635,11 @@ def trading_loop():
             log.error(f"Erreur boucle : {e}")
             send_message(f"⚠️ Erreur : `{e}`")
 
-        time.sleep(60)
+        # Attendre 60s mais interruptible par force_scan
+        for _ in range(60):
+            if force_scan or not bot_running:
+                break
+            time.sleep(1)
 
     log.info("Boucle arrêtée")
 
@@ -555,6 +665,14 @@ def telegram_loop():
 
             if text.lower().startswith("/close"):
                 handle_close(text, chat_id)
+                continue
+
+            if text.lower().startswith("/buy"):
+                handle_buy(text, chat_id)
+                continue
+
+            if text.lower().startswith("/skip"):
+                handle_skip(text, chat_id)
                 continue
 
             if chat_id in pending_confirmations:

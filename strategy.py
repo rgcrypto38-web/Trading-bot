@@ -80,6 +80,8 @@ class TradingStrategy:
         self._usdc_pairs:        list  = []
         self._last_pair_refresh: float = 0
         self._morning_done_date: str   = ""
+        self._cooldowns:         dict  = {}  # {symbol: iso_datetime} re-entry cooldowns
+        self._skip_list:         dict  = {}  # {symbol: iso_datetime} blacklist manuelle
 
         self._load_state()
 
@@ -95,6 +97,8 @@ class TradingStrategy:
             "losses":            self.losses,
             "total_pnl_history": self.total_pnl_history,
             "morning_done_date": self._morning_done_date,
+            "cooldowns":         self._cooldowns,
+            "skip_list":         self._skip_list,
             "saved_at":          datetime.utcnow().isoformat(),
         }
         try:
@@ -119,6 +123,8 @@ class TradingStrategy:
             self.losses             = state.get("losses", 0)
             self.total_pnl_history  = state.get("total_pnl_history", [])
             self._morning_done_date = state.get("morning_done_date", "")
+            self._cooldowns         = state.get("cooldowns", {})
+            self._skip_list         = state.get("skip_list", {})
             log.info(f"État rechargé — {len(self.positions)} position(s)")
         except Exception as e:
             log.error(f"Erreur chargement état : {e}")
@@ -158,6 +164,25 @@ class TradingStrategy:
         pnl_usdc = (size_usdc / entry) * ts_exit - size_usdc
         pnl_pct  = (ts_exit - entry) / entry * 100
         return round(pnl_usdc, 4), round(pnl_pct, 4)
+
+    # ── Multiplicateur TS adaptatif selon volatilité ─────────────────────────
+    def _get_ts_mult(self, atr: float, price: float) -> float:
+        """
+        Retourne le multiplicateur ATR pour le trailing stop,
+        adapté à la volatilité relative de la paire.
+        Plus la paire est volatile, plus le TS est serré.
+        """
+        if price <= 0:
+            return ATR_TS_MULT
+        volatility_pct = (atr / price) * 100
+        if volatility_pct < 1.0:
+            return 3.5   # paire calme (ex: BTC, ETH) — laisser respirer
+        elif volatility_pct < 3.0:
+            return 3.0   # volatilité normale — valeur par défaut
+        elif volatility_pct < 5.0:
+            return 2.5   # assez volatile — resserrer
+        else:
+            return 2.0   # très volatile (small caps) — serré
 
     # ── Métriques de performance ──────────────────────────────────────────────
     def get_metrics(self) -> dict:
@@ -283,11 +308,11 @@ class TradingStrategy:
     # ── Filtre régime BTC ─────────────────────────────────────────────────────
     def _btc_regime_ok(self) -> bool:
         """
-        Retourne True si BTC > EMA200 sur 4h (régime haussier global).
+        Retourne True si BTC > EMA200 sur 1h (régime haussier global).
         En cas d'erreur API, retourne True pour ne pas bloquer le bot.
         """
         try:
-            df = self._fetch_ohlcv(BTC_SYMBOL, TIMEFRAME_LONG, limit=220)
+            df = self._fetch_ohlcv(BTC_SYMBOL, TIMEFRAME_SHORT, limit=220)
             if df is None or len(df) < BTC_EMA_PERIOD:
                 return True
             df["ema200"] = df["close"].ewm(span=BTC_EMA_PERIOD).mean()
@@ -318,16 +343,18 @@ class TradingStrategy:
     def _compute_stops(self, entry: float, atr: float) -> tuple[float, float]:
         """
         Retourne (stop_loss, trailing_stop_initial) calculés depuis ATR.
+        TS adaptatif selon la volatilité relative (ATR/prix).
         Garde-fous min/max en % appliqués.
         """
-        # SL
+        # SL fixe
         sl_raw   = entry - atr * ATR_SL_MULT
         sl_pct   = (entry - sl_raw) / entry * 100
         sl_pct   = max(SL_MIN_PCT, min(SL_MAX_PCT, sl_pct))
         sl_price = entry * (1 - sl_pct / 100)
 
-        # TS initial (même logique, depuis l'entrée)
-        ts_raw   = entry - atr * ATR_TS_MULT
+        # TS adaptatif selon volatilité
+        ts_mult  = self._get_ts_mult(atr, entry)
+        ts_raw   = entry - atr * ts_mult
         ts_pct   = (entry - ts_raw) / entry * 100
         ts_pct   = max(TS_MIN_PCT, min(TS_MAX_PCT, ts_pct))
         ts_price = entry * (1 - ts_pct / 100)
@@ -335,8 +362,12 @@ class TradingStrategy:
         return round(sl_price, 8), round(ts_price, 8)
 
     # ── Signal d'entrée complet ───────────────────────────────────────────────
-    def _analyze_signal(self, symbol: str) -> dict:
+    def _analyze_signal(self, symbol: str, bear_mode: bool = False) -> dict:
         result = {"valid": False, "price": 0.0, "atr": 0.0, "details": ""}
+
+        # En bear mode : filtres resserrés
+        rsi_min  = RSI_MIN_ENTRY + 10 if bear_mode else RSI_MIN_ENTRY   # 55 au lieu de 45
+        vol_mult = VOLUME_MULTIPLIER * 1.5 if bear_mode else VOLUME_MULTIPLIER  # ×3 au lieu de ×2
 
         # ── Données 1h ────────────────────────────────────────────────────────
         df1 = self._fetch_ohlcv(symbol, TIMEFRAME_SHORT)
@@ -352,9 +383,9 @@ class TradingStrategy:
         ema1h_ok   = bool(last1["ema20"] > last1["ema50"])
         close1h_ok = bool(last1["close"] > last1["ema20"])
         vol_ratio  = float(last1["vol"] / last1["vol_ma"]) if last1["vol_ma"] > 0 else 0.0
-        vol_ok     = vol_ratio >= VOLUME_MULTIPLIER
+        vol_ok     = vol_ratio >= vol_mult
         rsi_val    = self._rsi(df1["close"])
-        rsi_ok     = RSI_MIN_ENTRY <= rsi_val <= RSI_MAX_ENTRY
+        rsi_ok     = rsi_min <= rsi_val <= RSI_MAX_ENTRY
         slope      = self._ema_slope(df1["close"])
         slope_ok   = slope > EMA_SLOPE_MIN
         atr_val    = self._atr(df1)
@@ -387,8 +418,8 @@ class TradingStrategy:
             f"{'✅' if ema1h_ok   else '❌'} [1h] EMA20 ({last1['ema20']:.4f}) {'>' if ema1h_ok else '<'} EMA50 ({last1['ema50']:.4f})",
             f"{'✅' if close1h_ok else '❌'} [1h] Clôture ({last1['close']:.4f}) {'>' if close1h_ok else '<'} EMA20",
             f"{'✅' if slope_ok   else '❌'} [1h] Pente EMA20 : {slope:+.6f} ({'OK' if slope_ok else 'plate/baissière'})",
-            f"{'✅' if vol_ok     else '❌'} [1h] Volume ×{vol_ratio:.2f} (seuil ×{VOLUME_MULTIPLIER})",
-            f"{'✅' if rsi_ok     else '❌'} [1h] RSI {rsi_val:.1f} (zone {RSI_MIN_ENTRY}–{RSI_MAX_ENTRY})",
+            f"{'✅' if vol_ok     else '❌'} [1h] Volume ×{vol_ratio:.2f} (seuil ×{vol_mult:.1f}{'⚠️ bear' if bear_mode else ''})",
+            f"{'✅' if rsi_ok     else '❌'} [1h] RSI {rsi_val:.1f} (zone {rsi_min}–{RSI_MAX_ENTRY}{'⚠️ bear' if bear_mode else ''})",
             f"{'✅' if ema4h_ok   else '❌'} [4h] {ema4h_str}",
             f"{'✅' if spread_ok  else '❌'} Spread ({'OK' if spread_ok else f'> {MAX_SPREAD_PCT}%'})",
             f"📊 ATR : {atr_val:.6f}",
@@ -513,10 +544,11 @@ class TradingStrategy:
             pos["highest"] = current_price
             atr = pos.get("atr", 0)
             if atr > 0:
-                new_ts = current_price - atr * ATR_TS_MULT
-                ts_pct = (current_price - new_ts) / current_price * 100
-                ts_pct = max(TS_MIN_PCT, min(TS_MAX_PCT, ts_pct))
-                new_ts = current_price * (1 - ts_pct / 100)
+                ts_mult = self._get_ts_mult(atr, current_price)
+                new_ts  = current_price - atr * ts_mult
+                ts_pct  = (current_price - new_ts) / current_price * 100
+                ts_pct  = max(TS_MIN_PCT, min(TS_MAX_PCT, ts_pct))
+                new_ts  = current_price * (1 - ts_pct / 100)
             else:
                 new_ts = current_price * (1 - TS_MIN_PCT / 100)
             pos["trailing_stop"] = round(new_ts, 8)
@@ -609,6 +641,22 @@ class TradingStrategy:
         else:
             self.losses += 1
         self.total_pnl_history.append([round(pnl_usdc, 4), round(pnl_pct, 4)])
+
+        # ── Cooldown re-entry (Option C) ──────────────────────────────────────
+        tp1_done = pos.get("tp1_done", False)
+        if reason == "Stop Loss":
+            cooldown_h = 48   # SL direct = punition longue
+        elif "Abandon" in reason:
+            cooldown_h = 24   # abandon matin = pause standard
+        elif reason == "Trailing Stop" and tp1_done:
+            cooldown_h = 12   # TS avec TP1 déjà fait = sortie propre
+        else:
+            cooldown_h = 48   # TS sans TP1 = sorti trop tôt
+        self._cooldowns[symbol] = (
+            datetime.utcnow() + timedelta(hours=cooldown_h)
+        ).isoformat()
+        log.info(f"Cooldown {symbol} : {cooldown_h}h (raison : {reason})")
+
         self._save_state()
 
         opened_at  = pos.get("opened_at", "")
@@ -828,20 +876,48 @@ class TradingStrategy:
             log.warning("Drawdown journalier atteint — nouvelles entrées bloquées")
             return alerts
 
-        # ── Étape 3 : filtre régime BTC (une vérification par scan)
-        if not self._btc_regime_ok():
-            log.info("Régime BTC baissier — nouvelles entrées bloquées")
-            return alerts
+        # ── Étape 3 : filtre régime BTC (bear mode au lieu de blocage total)
+        btc_ok    = self._btc_regime_ok()
+        bear_mode = not btc_ok
+        if bear_mode:
+            log.info("Régime BTC baissier — filtres resserrés (RSI+10, Volume×1.5)")
 
         # ── Étape 4 : nouvelles entrées
         if len(self.positions) < MAX_POSITIONS and self._position_size() > 0:
+            now_utc = datetime.utcnow()
             for symbol in self._get_usdc_pairs():
                 if symbol in self.positions:
                     continue
                 if len(self.positions) >= MAX_POSITIONS:
                     break
+
+                # Vérifier cooldown re-entry
+                if symbol in self._cooldowns:
+                    try:
+                        until = datetime.fromisoformat(self._cooldowns[symbol])
+                        if now_utc < until:
+                            remaining = int((until - now_utc).total_seconds() / 3600)
+                            log.debug(f"Skip {symbol} — cooldown {remaining}h restantes")
+                            continue
+                        else:
+                            del self._cooldowns[symbol]   # cooldown expiré
+                    except Exception:
+                        del self._cooldowns[symbol]
+
+                # Vérifier skip list manuelle
+                if symbol in self._skip_list:
+                    try:
+                        until = datetime.fromisoformat(self._skip_list[symbol])
+                        if now_utc < until:
+                            log.debug(f"Skip {symbol} — blacklist manuelle")
+                            continue
+                        else:
+                            del self._skip_list[symbol]
+                    except Exception:
+                        del self._skip_list[symbol]
+
                 try:
-                    analysis = self._analyze_signal(symbol)
+                    analysis = self._analyze_signal(symbol, bear_mode=bear_mode)
                     if analysis["valid"]:
                         msg = self._open_position(symbol, analysis)
                         if msg:
@@ -850,6 +926,73 @@ class TradingStrategy:
                     log.debug(f"Skip {symbol} : {e}")
 
         return alerts
+
+    def skip_symbol(self, symbol: str, hours: int = 24) -> str:
+        """Blacklist manuelle d'une paire pendant N heures."""
+        sym   = symbol.upper()
+        until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
+        self._skip_list[sym] = until
+        self._save_state()
+        return f"⛔ `{sym}` ignoré pendant {hours}h."
+
+    def get_cooldowns_status(self) -> str:
+        """Retourne l'état des cooldowns et skip list actifs."""
+        now   = datetime.utcnow()
+        lines = []
+        for symbol, until_iso in self._cooldowns.items():
+            try:
+                until = datetime.fromisoformat(until_iso)
+                if now < until:
+                    h = int((until - now).total_seconds() / 3600)
+                    lines.append(f"🔄 `{symbol}` — cooldown {h}h restantes")
+            except Exception:
+                pass
+        for symbol, until_iso in self._skip_list.items():
+            try:
+                until = datetime.fromisoformat(until_iso)
+                if now < until:
+                    h = int((until - now).total_seconds() / 3600)
+                    lines.append(f"⛔ `{symbol}` — skip {h}h restantes")
+            except Exception:
+                pass
+        return "\n".join(lines) if lines else "✅ Aucun cooldown ni blacklist actif."
+
+    def open_position_manual(self, symbol: str) -> str:
+        """Force l'entrée sur une paire en ignorant tous les filtres."""
+        sym = symbol.upper()
+        if sym in self.positions:
+            return f"⚠️ Position déjà ouverte sur `{sym}`."
+        if len(self.positions) >= MAX_POSITIONS:
+            return f"⚠️ Nombre max de positions atteint ({MAX_POSITIONS})."
+        size = self._position_size()
+        if size <= 0:
+            return "⚠️ Capital insuffisant pour ouvrir une position."
+        try:
+            price = float(self.exchange.fetch_ticker(sym)["last"])
+        except Exception as e:
+            return f"⚠️ Impossible de récupérer le prix : {e}"
+        try:
+            df1   = self._fetch_ohlcv(sym, TIMEFRAME_SHORT)
+            atr   = self._atr(df1) if df1 is not None and len(df1) >= 14 else price * 0.02
+        except Exception:
+            atr   = price * 0.02  # ATR estimé à 2% si indisponible
+        analysis = {
+            "valid":   True,
+            "price":   price,
+            "atr":     atr,
+            "details": "⚡ Entrée manuelle forcée — filtres ignorés",
+        }
+        # Retirer le symbol des cooldowns et skip list si présent
+        self._cooldowns.pop(sym, None)
+        self._skip_list.pop(sym, None)
+        return self._open_position(sym, analysis)
+
+    def get_pnl_by_symbol(self) -> dict:
+        """Retourne le P&L cumulé par symbole depuis l'historique des trades."""
+        by_sym = {}
+        for sym, pos in self.positions.items():
+            by_sym[sym] = by_sym.get(sym, {"trades": 0, "pnl": 0.0})
+        return by_sym
 
     # ── Diagnostic marché (8h/12h/18h sans position) ─────────────────────────
     def scan_market_summary(self) -> str:
