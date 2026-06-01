@@ -1,1020 +1,395 @@
-import os
+"""
+Orchestrateur. Boucle unique (pas de threading concurrent -> pas de race condition) :
+  1) commandes Telegram (poll court)
+  2) univers (recalcule 1x/jour) ; donnees ; regime par paire
+  3) le regime aiguille vers LE moteur autorise -> entrees (sous garde-fous)
+  4) sorties de toutes les positions via leur moteur
+  5) persistance (positions + historique) ; recaps programmes ; evenements de regime
+
+Mode PAPER : execution simulee au prix du signal, cout aller-retour a la cloture.
+Persistance sur DATA_DIR (monter un volume Railway pour survivre aux redeploiements).
+"""
+import json
 import time
-import threading
-import logging
-from datetime import datetime, timezone, timedelta
-import requests
-from strategy import TradingStrategy
-from strategy_b import StrategyB
+import importlib
+import datetime as dt
+from typing import Dict, List
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger(__name__)
+import ccxt
+import pandas as pd
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-BINANCE_KEY      = os.environ.get("BINANCE_KEY")
-BINANCE_SECRET   = os.environ.get("BINANCE_SECRET")
-
-if not TELEGRAM_TOKEN:
-    raise EnvironmentError("Variable TELEGRAM_TOKEN manquante")
-if not TELEGRAM_CHAT_ID:
-    raise EnvironmentError("Variable TELEGRAM_CHAT_ID manquante")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-# ── Fuseau horaire ────────────────────────────────────────────────────────────
-PARIS_TZ           = timezone(timedelta(hours=2))
-RECAP_START_HOUR   = 7
-RECAP_END_HOUR     = 22
-MORNING_HOUR       = 7
-DIAGNOSTIC_HOURS   = {8, 12, 18}
-
-# ── Clavier Telegram ──────────────────────────────────────────────────────────
-KEYBOARD = {
-    "keyboard": [
-        ["▶️ Démarrer", "⏸ Pause"],
-        ["⏹ Arrêter",  "📊 Statut"],
-        ["📋 Trades",   "🔍 Debug"],
-        ["❌ Fermer",   "💣 Tout fermer"],
-        ["📈 Stats",    "⚡ Boost"],
-        ["⚙️ Aide"],
-    ],
-    "resize_keyboard": True,
-    "persistent":      True,
-}
-
-BUTTON_MAP = {
-    "▶️ démarrer":    "start",
-    "⏸ pause":        "pause",
-    "⏹ arrêter":      "stop",
-    "📊 statut":       "status",
-    "📋 trades":       "positions",
-    "🔍 debug":        "debug_prompt",
-    "❌ fermer":       "close_prompt",
-    "💣 tout fermer":  "closeall_prompt",
-    "📈 stats":        "stats",
-    "⚡ boost":        "boost",
-    "⚙️ aide":         "help",
-    "/start":         "start",
-    "/stop":          "stop",
-    "/pause":         "pause",
-    "/status":        "status",
-    "/positions":     "positions",
-    "/help":          "help",
-    "/stats":         "stats",
-    "/boost":         "boost",
-    "/statsb":        "stats_b",
-    "/boostb":        "boost_b",
-}
-
-# États conversationnels : chat_id → {"waiting": "debug"|"close", "strategy": "a"|"b"}
-waiting_input: dict = {}
-
-# Confirmations : chat_id → {"action": str, "symbol": str|None, "strategy": "a"|"b"}
-pending_confirmations: dict = {}
-
-# ── État global ───────────────────────────────────────────────────────────────
-bot_running           = False
-bot_paused            = False
-strategy              = None    # Stratégie A
-strategy_b            = None    # Stratégie B
-last_update_id        = 0
-last_recap_hour       = -1
-last_diagnostic_hour  = -1
-last_morning_hour     = -1
-last_recap_hour_b     = -1
-last_diagnostic_hour_b = -1
-last_morning_hour_b   = -1
-last_reset_date       = ""
-force_scan            = False
-force_scan_b          = False
-_trading_thread       = None
-_trading_thread_b     = None
-
-# ── Locks threading ───────────────────────────────────────────────────────────
-_diagnostic_lock    = threading.Lock()
-_recap_lock         = threading.Lock()
-_diagnostic_lock_b  = threading.Lock()
-_recap_lock_b       = threading.Lock()
+import config as C
+import regime as R
+import indicators as ind
+from base_strategy import BaseStrategy, Signal, SignalType
+from alerts import AlertManager, BUTTON_MAP
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def send_message(text: str, chat_id: str = None):
-    cid = chat_id or TELEGRAM_CHAT_ID
+# ---------------------------------------------------------------------------
+# Fonctions pures (testables hors-ligne)
+# ---------------------------------------------------------------------------
+def filter_universe(markets: dict, tickers: dict, open_symbols: set) -> List[str]:
+    """Paires QUOTE spot actives, volume 24h >= seuil, hors tokens a levier/stables.
+    Une paire avec position ouverte est conservee meme si elle sort du filtre."""
+    out = []
+    for sym, m in markets.items():
+        if not (m.get("spot") and m.get("active") and m.get("quote") == C.QUOTE):
+            continue
+        base = m.get("base", "")
+        if base in C.EXCLUDE_BASES or any(base.endswith(x) for x in C.EXCLUDE_TOKENS):
+            continue
+        qv = (tickers.get(sym) or {}).get("quoteVolume")
+        if qv is not None and qv >= C.MIN_QUOTE_VOLUME_24H:
+            out.append(sym)
+    return sorted(set(out) | set(open_symbols))
+
+
+def compute_metrics(trades: List[dict], strategies) -> List[dict]:
+    """Metriques par strategie a partir de l'historique des trades clotures."""
+    res = []
+    for tag, strat in strategies.items():
+        t = [x for x in trades if x["tag"] == tag]
+        if not t:
+            res.append({"tag": tag, "label": strat.label, "trades": 0})
+            continue
+        pnls = [x["pnl_usdc"] for x in t]
+        rs = [x["r_multiple"] for x in t]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        win_rs = [r for r in rs if r > 0]
+        loss_rs = [r for r in rs if r <= 0]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        # max drawdown sur la courbe de capital cumulee
+        cum, peak, dd = 0.0, 0.0, 0.0
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            dd = min(dd, cum - peak)
+        avg_win_r = sum(win_rs) / len(win_rs) if win_rs else 0.0
+        avg_loss_r = sum(loss_rs) / len(loss_rs) if loss_rs else 0.0
+        res.append({
+            "tag": tag, "label": strat.label, "trades": len(t),
+            "winrate": 100 * len(wins) / len(t),
+            "expectancy_r": sum(rs) / len(rs),
+            "avg_win_r": avg_win_r, "avg_loss_r": avg_loss_r,
+            "payoff": (avg_win_r / abs(avg_loss_r)) if avg_loss_r else float("inf"),
+            "pf": (gross_win / gross_loss) if gross_loss else float("inf"),
+            "max_dd": dd,
+        })
+    return res
+
+
+def local_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=C.TZ_OFFSET_HOURS)
+
+
+# ---------------------------------------------------------------------------
+# Donnees
+# ---------------------------------------------------------------------------
+def fetch_df(exchange, symbol, timeframe, limit):
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id":      cid,
-                "text":         text,
-                "parse_mode":   "Markdown",
-                "reply_markup": KEYBOARD,
-            },
-            timeout=10,
-        )
+        raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not raw:
+            return None
+        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        return df.set_index("ts")
     except Exception as e:
-        log.error(f"Envoi Telegram échoué : {e}")
+        print(f"[data] {symbol} {timeframe}: {e}")
+        return None
 
 
-def get_updates(offset: int = 0):
+# ---------------------------------------------------------------------------
+# Persistance
+# ---------------------------------------------------------------------------
+def _load(path, default):
     try:
-        r = requests.get(
-            f"{TELEGRAM_API}/getUpdates",
-            params={"offset": offset, "timeout": 30},
-            timeout=35,
-        )
-        return r.json().get("result", [])
-    except Exception as e:
-        log.error(f"getUpdates échoué : {e}")
-        return []
-
-
-# ── Statut combiné A + B ──────────────────────────────────────────────────────
-def build_status() -> str:
-    if not strategy:
-        return "🔴 Bot arrêté."
-
-    state = "⏸ En pause" if bot_paused else "🟢 Actif"
-    lines = [f"*{state} — Mode PAPER*\n"]
-
-    # ── Stratégie A ───────────────────────────────────────────────────────────
-    stats_a   = strategy.get_stats()
-    metrics_a = strategy.get_metrics()
-    pos_a     = strategy.get_positions()
-
-    lines.append("━━━ *Stratégie A — Trend Following* ━━━")
-    lines.append(
-        f"💼 Capital : `{stats_a['capital']:.2f}` USDC | "
-        f"G/P jour : `{stats_a['pnl_today']:+.2f}` | "
-        f"Total : `{stats_a['pnl']:+.2f}` USDC"
-    )
-    lines.append(f"🔢 {stats_a['total_trades']} trades (✅ {stats_a['wins']} / ❌ {stats_a['losses']})")
-
-    if stats_a["total_trades"] >= 3:
-        pf_str = (f"{metrics_a['profit_factor']:.2f}"
-                  if metrics_a["profit_factor"] != float("inf") else "∞")
-        lines.append(
-            f"📐 Winrate `{metrics_a['winrate']:.1f}%` | PF `{pf_str}` | "
-            f"Sharpe `{metrics_a['sharpe']:.2f}` | DD `{metrics_a['max_drawdown']:.2f}` USDC"
-        )
-
-    if pos_a:
-        lines.append(f"📌 *{len(pos_a)} position(s) :*")
-        for p in pos_a:
-            secured    = p.get("secured_pnl_usdc", 0.0)
-            total_usdc = secured + p["pnl_usdc"]
-            size_init  = p.get("size_usdc_initial", p["size_usdc"])
-            total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-            gp_emoji   = "📈" if total_pct >= 0 else "📉"
-            parts      = []
-            if p["tp1_done"]:
-                parts.append("TP1✅")
-            if p["tp2_done"]:
-                parts.append("TP2✅")
-            parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-            lines.append(
-                f"{gp_emoji} `{p['symbol']}` | "
-                f"`{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`"
-            )
-    else:
-        lines.append("📭 Aucune position A")
-
-    # ── Stratégie B ───────────────────────────────────────────────────────────
-    lines.append("")
-    if strategy_b:
-        stats_b   = strategy_b.get_stats()
-        metrics_b = strategy_b.get_metrics()
-        pos_b     = strategy_b.get_positions()
-
-        lines.append("━━━ *Stratégie B — Momentum Breakout* ━━━")
-        lines.append(
-            f"💼 Capital : `{stats_b['capital']:.2f}` USDC | "
-            f"G/P jour : `{stats_b['pnl_today']:+.2f}` | "
-            f"Total : `{stats_b['pnl']:+.2f}` USDC"
-        )
-        lines.append(f"🔢 {stats_b['total_trades']} trades (✅ {stats_b['wins']} / ❌ {stats_b['losses']})")
-
-        if stats_b["total_trades"] >= 3:
-            pf_str = (f"{metrics_b['profit_factor']:.2f}"
-                      if metrics_b["profit_factor"] != float("inf") else "∞")
-            lines.append(
-                f"📐 Winrate `{metrics_b['winrate']:.1f}%` | PF `{pf_str}` | "
-                f"Sharpe `{metrics_b['sharpe']:.2f}` | DD `{metrics_b['max_drawdown']:.2f}` USDC"
-            )
-
-        if pos_b:
-            lines.append(f"📌 *{len(pos_b)} position(s) :*")
-            for p in pos_b:
-                secured    = p.get("secured_pnl_usdc", 0.0)
-                total_usdc = secured + p["pnl_usdc"]
-                size_init  = p.get("size_usdc_initial", p["size_usdc"])
-                total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-                gp_emoji   = "📈" if total_pct >= 0 else "📉"
-                parts      = []
-                if p["tp1_done"]:
-                    parts.append("TP1✅")
-                if p["tp2_done"]:
-                    parts.append("TP2✅")
-                parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-                lines.append(
-                    f"{gp_emoji} `{p['symbol']}` | "
-                    f"`{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`"
-                )
-        else:
-            lines.append("📭 Aucune position B")
-    else:
-        lines.append("━━━ *Stratégie B* — non démarrée ━━━")
-
-    return "\n".join(lines)
-
-
-# ── Stats détaillées A ────────────────────────────────────────────────────────
-def build_stats() -> str:
-    if not strategy:
-        return "🔴 Bot arrêté."
-    stats   = strategy.get_stats()
-    metrics = strategy.get_metrics()
-    state   = "⏸ En pause" if bot_paused else "🟢 Actif"
-    lines   = [
-        f"📈 *Stats A — Trend Following* — {state}",
-        f"💼 Capital : `{stats['capital']:.2f}` USDC",
-        f"📊 G/P total : `{stats['pnl']:+.2f}` USDC | Aujourd'hui : `{stats['pnl_today']:+.2f}` USDC",
-        f"🔢 {stats['total_trades']} trades (✅ {stats['wins']} / ❌ {stats['losses']})",
-    ]
-    if stats["total_trades"] >= 3:
-        pf_str = (f"{metrics['profit_factor']:.2f}"
-                  if metrics["profit_factor"] != float("inf") else "∞")
-        lines += [
-            f"\n📐 *Métriques :*",
-            f"  Winrate : `{metrics['winrate']:.1f}%`",
-            f"  Profit Factor : `{pf_str}`",
-            f"  Expectancy : `{metrics['expectancy']:+.4f}` USDC/trade",
-            f"  Max Drawdown : `{metrics['max_drawdown']:.2f}` USDC",
-            f"  Sharpe : `{metrics['sharpe']:.2f}`",
-        ]
-    else:
-        lines.append("_Métriques disponibles à partir de 3 trades fermés._")
-    if strategy:
-        lines.append(f"\n🔄 *Cooldowns A :*\n{strategy.get_cooldowns_status()}")
-    return "\n".join(lines)
-
-
-# ── Stats détaillées B ────────────────────────────────────────────────────────
-def build_stats_b() -> str:
-    if not strategy_b:
-        return "ℹ️ Stratégie B non démarrée."
-    stats   = strategy_b.get_stats()
-    metrics = strategy_b.get_metrics()
-    state   = "⏸ En pause" if bot_paused else "🟢 Actif"
-    lines   = [
-        f"📈 *Stats B — Momentum Breakout* — {state}",
-        f"💼 Capital : `{stats['capital']:.2f}` USDC",
-        f"📊 G/P total : `{stats['pnl']:+.2f}` USDC | Aujourd'hui : `{stats['pnl_today']:+.2f}` USDC",
-        f"🔢 {stats['total_trades']} trades (✅ {stats['wins']} / ❌ {stats['losses']})",
-    ]
-    if stats["total_trades"] >= 3:
-        pf_str = (f"{metrics['profit_factor']:.2f}"
-                  if metrics["profit_factor"] != float("inf") else "∞")
-        lines += [
-            f"\n📐 *Métriques :*",
-            f"  Winrate : `{metrics['winrate']:.1f}%`",
-            f"  Profit Factor : `{pf_str}`",
-            f"  Expectancy : `{metrics['expectancy']:+.4f}` USDC/trade",
-            f"  Max Drawdown : `{metrics['max_drawdown']:.2f}` USDC",
-            f"  Sharpe : `{metrics['sharpe']:.2f}`",
-        ]
-    else:
-        lines.append("_Métriques disponibles à partir de 3 trades fermés._")
-    lines.append(f"\n🔄 *Cooldowns B :*\n{strategy_b.get_cooldowns_status()}")
-    return "\n".join(lines)
-
-
-# ── Récap horaire A ───────────────────────────────────────────────────────────
-def build_recap() -> str:
-    if not strategy:
-        return ""
-    stats     = strategy.get_stats()
-    positions = strategy.get_positions()
-    now       = datetime.now(PARIS_TZ).strftime("%H:%M")
-    state     = "⏸ En pause" if bot_paused else "🟢 Actif"
-    lines     = [
-        f"🕐 *Récap A {now}* — {state}",
-        f"💼 `{stats['capital']:.2f}` USDC | G/P jour : `{stats['pnl_today']:+.2f}` | Total : `{stats['pnl']:+.2f}` USDC",
-        f"🔢 {stats['total_trades']} trades (✅ {stats['wins']} / ❌ {stats['losses']})",
-    ]
-    if positions:
-        lines.append(f"\n📌 *{len(positions)} position(s) :*")
-        for p in positions:
-            secured    = p.get("secured_pnl_usdc", 0.0)
-            total_usdc = secured + p["pnl_usdc"]
-            size_init  = p.get("size_usdc_initial", p["size_usdc"])
-            total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-            gp_emoji   = "📈" if total_pct >= 0 else "📉"
-            parts      = []
-            if p["tp1_done"]:
-                parts.append("TP1✅")
-            if p["tp2_done"]:
-                parts.append("TP2✅")
-            parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-            lines.append(
-                f"{gp_emoji} `{p['symbol']}` | "
-                f"`{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`"
-            )
-    return "\n".join(lines)
-
-
-# ── Récap horaire B ───────────────────────────────────────────────────────────
-def build_recap_b() -> str:
-    if not strategy_b:
-        return ""
-    stats     = strategy_b.get_stats()
-    positions = strategy_b.get_positions()
-    now       = datetime.now(PARIS_TZ).strftime("%H:%M")
-    state     = "⏸ En pause" if bot_paused else "🟢 Actif"
-    lines     = [
-        f"🕐 *Récap B {now}* — {state}",
-        f"💼 `{stats['capital']:.2f}` USDC | G/P jour : `{stats['pnl_today']:+.2f}` | Total : `{stats['pnl']:+.2f}` USDC",
-        f"🔢 {stats['total_trades']} trades (✅ {stats['wins']} / ❌ {stats['losses']})",
-    ]
-    if positions:
-        lines.append(f"\n📌 *{len(positions)} position(s) B :*")
-        for p in positions:
-            secured    = p.get("secured_pnl_usdc", 0.0)
-            total_usdc = secured + p["pnl_usdc"]
-            size_init  = p.get("size_usdc_initial", p["size_usdc"])
-            total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-            gp_emoji   = "📈" if total_pct >= 0 else "📉"
-            parts      = []
-            if p["tp1_done"]:
-                parts.append("TP1✅")
-            if p["tp2_done"]:
-                parts.append("TP2✅")
-            parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-            lines.append(
-                f"{gp_emoji} `{p['symbol']}` | "
-                f"`{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`"
-            )
-    return "\n".join(lines)
-
-
-# ── Trades détaillés A ────────────────────────────────────────────────────────
-def build_trades() -> str:
-    if not strategy:
-        return "ℹ️ Aucune stratégie active."
-    positions = strategy.get_positions()
-    if not positions:
-        return "📭 [A] Aucune position ouverte."
-    lines = ["📋 *Positions A ouvertes :*\n"]
-    for p in positions:
-        secured    = p.get("secured_pnl_usdc", 0.0)
-        total_usdc = secured + p["pnl_usdc"]
-        size_init  = p.get("size_usdc_initial", p["size_usdc"])
-        total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-        gp_emoji   = "📈" if total_pct >= 0 else "📉"
-        tp1_tag    = "✅" if p["tp1_done"] else "⏳"
-        tp2_tag    = "✅" if p["tp2_done"] else "⏳"
-        parts      = []
-        if p["tp1_done"]:
-            parts.append("TP1✅")
-        if p["tp2_done"]:
-            parts.append("TP2✅")
-        parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-        lines.append(
-            f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
-            f"  Investi : `{size_init:.2f}` USDC (restant : `{p['size_usdc']:.2f}` USDC)\n"
-            f"  G/P : `{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`\n"
-            f"  Entrée : `{p['entry']:.6f}` → Actuel : `{p['current']:.6f}`\n"
-            f"  TP1 {tp1_tag} `{p['tp1_price']:.6f}` | TP2 {tp2_tag} `{p['tp2_price']:.6f}`\n"
-            f"  TS : `{p['ts_price']:.6f}` | 💵 Min si TS : `{p['ts_pnl']:+.2f}` USDC\n"
-        )
-
-    # Ajouter les positions B si présentes
-    if strategy_b:
-        positions_b = strategy_b.get_positions()
-        if positions_b:
-            lines.append("\n📋 *Positions B ouvertes :*\n")
-            for p in positions_b:
-                secured    = p.get("secured_pnl_usdc", 0.0)
-                total_usdc = secured + p["pnl_usdc"]
-                size_init  = p.get("size_usdc_initial", p["size_usdc"])
-                total_pct  = total_usdc / size_init * 100 if size_init > 0 else 0.0
-                gp_emoji   = "📈" if total_pct >= 0 else "📉"
-                tp1_tag    = "✅" if p["tp1_done"] else "⏳"
-                tp2_tag    = "✅" if p["tp2_done"] else "⏳"
-                parts      = []
-                if p["tp1_done"]:
-                    parts.append("TP1✅")
-                if p["tp2_done"]:
-                    parts.append("TP2✅")
-                parts.append(f"flottant:`{p['pnl_usdc']:+.2f}`")
-                lines.append(
-                    f"{gp_emoji} `{p['symbol']}` | Ouvert le {p['opened_at']}\n"
-                    f"  Investi : `{size_init:.2f}` USDC (restant : `{p['size_usdc']:.2f}` USDC)\n"
-                    f"  G/P : `{total_usdc:+.2f}` USDC ({' + '.join(parts)}) → `{total_pct:+.2f}%`\n"
-                    f"  Entrée : `{p['entry']:.6f}` → Actuel : `{p['current']:.6f}`\n"
-                    f"  TP1 {tp1_tag} `{p['tp1_price']:.6f}` (+6%) | "
-                    f"TP2 {tp2_tag} `{p['tp2_price']:.6f}` (+12%)\n"
-                    f"  TS : `{p['ts_price']:.6f}` | 💵 Min si TS : `{p['ts_pnl']:+.2f}` USDC\n"
-                )
-    return "\n".join(lines)
-
-
-# ── Guards temporels ──────────────────────────────────────────────────────────
-def should_send_recap() -> bool:
-    global last_recap_hour
-    now = datetime.now(PARIS_TZ)
-    h, m = now.hour, now.minute
-    with _recap_lock:
-        if RECAP_START_HOUR <= h < RECAP_END_HOUR and h != last_recap_hour and m <= 3:
-            last_recap_hour = h
-            return True
-    return False
-
-
-def should_send_recap_b() -> bool:
-    global last_recap_hour_b
-    now = datetime.now(PARIS_TZ)
-    h, m = now.hour, now.minute
-    with _recap_lock_b:
-        if RECAP_START_HOUR <= h < RECAP_END_HOUR and h != last_recap_hour_b and m <= 3:
-            last_recap_hour_b = h
-            return True
-    return False
-
-
-def should_send_diagnostic() -> bool:
-    global last_diagnostic_hour
-    now = datetime.now(PARIS_TZ)
-    h, m = now.hour, now.minute
-    with _diagnostic_lock:
-        if h in DIAGNOSTIC_HOURS and h != last_diagnostic_hour and m <= 3:
-            last_diagnostic_hour = h
-            return True
-    return False
-
-
-def should_send_diagnostic_b() -> bool:
-    global last_diagnostic_hour_b
-    now = datetime.now(PARIS_TZ)
-    h, m = now.hour, now.minute
-    with _diagnostic_lock_b:
-        if h in DIAGNOSTIC_HOURS and h != last_diagnostic_hour_b and m <= 3:
-            last_diagnostic_hour_b = h
-            return True
-    return False
-
-
-# ── Reset minuit ──────────────────────────────────────────────────────────────
-def check_midnight_reset():
-    global last_reset_date, last_morning_hour, last_recap_hour, last_diagnostic_hour
-    global last_morning_hour_b, last_recap_hour_b, last_diagnostic_hour_b
-    today = datetime.now(PARIS_TZ).date().isoformat()
-    if today != last_reset_date:
-        last_reset_date        = today
-        last_morning_hour      = -1
-        last_recap_hour        = -1
-        last_diagnostic_hour   = -1
-        last_morning_hour_b    = -1
-        last_recap_hour_b      = -1
-        last_diagnostic_hour_b = -1
-        if strategy:
-            strategy.reset_daily_pnl()
-        if strategy_b:
-            strategy_b.reset_daily_pnl()
-        log.info("Reset journalier — tous les compteurs réinitialisés")
-
-
-# ── Clôture manuelle avec confirmation ────────────────────────────────────────
-def handle_close(text: str, chat_id: str, strat: str = "a"):
-    strat_obj = strategy if strat == "a" else strategy_b
-    prefix    = "" if strat == "a" else "b"
-    label     = "A" if strat == "a" else "B"
-
-    if not strat_obj:
-        send_message(f"ℹ️ Stratégie {label} non active.", chat_id)
-        return
-
-    cmd = text.strip().upper()
-    if cmd in ["/CLOSEALL", "/CLOSEBALL"]:
-        positions = strat_obj.get_positions()
-        if not positions:
-            send_message(f"📭 [{ label}] Aucune position ouverte.", chat_id)
-            return
-        symbols = ", ".join([f"`{p['symbol']}`" for p in positions])
-        pending_confirmations[chat_id] = {
-            "action": "closeall", "symbol": None, "strategy": strat
-        }
-        send_message(
-            f"⚠️ *Confirmation requise*\n\n"
-            f"Fermer *toutes les positions {label}* : {symbols} ?\n\n"
-            f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
-            chat_id,
-        )
-        return
-
-    parts = text.strip().split()
-    if len(parts) < 2:
-        send_message(f"Usage : `/close{'b' if strat == 'b' else ''} SYMBOL`", chat_id)
-        return
-
-    symbol = parts[1].upper()
-    if "/" not in symbol:
-        symbol = symbol + "/USDC"
-
-    if symbol not in strat_obj.positions:
-        send_message(f"❓ [{label}] Aucune position ouverte sur `{symbol}`.", chat_id)
-        return
-
-    pos = strat_obj.positions[symbol]
-    try:
-        price = float(strat_obj.exchange.fetch_ticker(symbol)["last"])
-        pnl_u, pnl_p = strat_obj._calc_pnl(pos["size_usdc"], pos["entry"], price)
-        prix_str = (f"Prix actuel : `{price:.6f}` | "
-                    f"G/P estimé : `{pnl_u:+.2f}` USDC (`{pnl_p:+.2f}%`)")
+        with open(path) as f:
+            return json.load(f)
     except Exception:
-        prix_str = "Prix actuel indisponible"
-
-    pending_confirmations[chat_id] = {
-        "action": "close", "symbol": symbol, "strategy": strat
-    }
-    send_message(
-        f"⚠️ *Confirmation requise*\n\n[{label}] Fermer `{symbol}` ?\n{prix_str}\n\n"
-        f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
-        chat_id,
-    )
+        return default
 
 
-def handle_confirmation(text: str, chat_id: str):
-    pending  = pending_confirmations.get(chat_id)
-    if not pending:
-        return
-    response = text.strip().upper()
-    if response == "NON":
-        del pending_confirmations[chat_id]
-        send_message("❎ Annulé.", chat_id)
-        return
-    if response == "OUI":
-        del pending_confirmations[chat_id]
-        strat    = pending.get("strategy", "a")
-        strat_obj = strategy if strat == "a" else strategy_b
-        if not strat_obj:
-            send_message("ℹ️ Stratégie non active.", chat_id)
-            return
-        if pending["action"] == "close":
-            send_message(strat_obj.close_position_manual(pending["symbol"]), chat_id)
-        elif pending["action"] == "closeall":
-            msgs = strat_obj.close_all_manual()
-            for msg in msgs:
-                send_message(msg, chat_id)
-            if not msgs:
-                send_message("📭 Aucune position à fermer.", chat_id)
-        elif pending["action"] == "buy":
-            msg = strat_obj.open_position_manual(pending["symbol"])
-            send_message(msg if msg else "⚠️ Entrée impossible.", chat_id)
-        return
-    send_message("Réponds *OUI* pour confirmer ou *NON* pour annuler.", chat_id)
+def _save(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+    except Exception as e:
+        print(f"[persist] ecriture {path}: {e}")
 
 
-# ── Réponse aux demandes de symbole ──────────────────────────────────────────
-def handle_waiting_input(text: str, chat_id: str):
-    state = waiting_input.pop(chat_id, None)
-    if not state:
-        return
-    symbol = text.strip().upper()
-    if "/" not in symbol:
-        symbol = symbol + "/USDC"
-    strat     = state.get("strategy", "a")
-    strat_obj = strategy if strat == "a" else strategy_b
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+class Bot:
+    def __init__(self):
+        self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        self.alerts = AlertManager()
+        self.strategies = self._load_strategies()
+        self.positions = _load(C.POSITIONS_FILE, [])      # rechargees -> pas re-alertees
+        self.trades = _load(C.TRADES_FILE, [])
+        self.universe: List[str] = []
+        self.market: Dict[str, pd.DataFrame] = {}
+        self.btc_ok = False
+        self.paused = False
+        self._tg_offset = None
+        self._fired = set()            # (date, hour) recaps deja envoyes
+        self._uni_day = None
+        self._btc_state = None         # pour detecter le flip macro
 
-    if state["waiting"] == "debug":
-        if not strat_obj:
-            send_message("ℹ️ Stratégie non active.", chat_id)
-            return
-        send_message(strat_obj.debug_position(symbol), chat_id)
-    elif state["waiting"] == "close":
-        cmd = "/closeb" if strat == "b" else "/close"
-        handle_close(f"{cmd} {symbol}", chat_id, strat)
+    def _load_strategies(self):
+        loaded = {}
+        for e in C.STRATEGIES:
+            if not e.get("enabled"):
+                continue
+            cls = getattr(importlib.import_module(e["module"]), e["class"])
+            inst = cls()
+            loaded[inst.tag] = inst
+        return loaded
 
+    # --- univers ----------------------------------------------------------
+    def refresh_universe(self):
+        try:
+            markets = self.exchange.load_markets()
+            cands = [s for s, m in markets.items()
+                     if m.get("spot") and m.get("active") and m.get("quote") == C.QUOTE]
+            tickers = self.exchange.fetch_tickers(cands)
+            self.universe = filter_universe(markets, tickers, {p["symbol"] for p in self.positions})
+            self._uni_day = local_now().date()
+            print(f"[univers] {len(self.universe)} paires >= {C.MIN_QUOTE_VOLUME_24H/1e6:g}M USDC")
+        except Exception as e:
+            self.alerts.error(f"Univers : {e}")
+            if not self.universe:
+                self.universe = ["BTC/USDC", "ETH/USDC"]   # repli minimal
 
-# ── Achat forcé (/buy / /buyb) ────────────────────────────────────────────────
-def handle_buy(text: str, chat_id: str, strat: str = "a"):
-    strat_obj = strategy if strat == "a" else strategy_b
-    label     = "A" if strat == "a" else "B"
-    if not strat_obj:
-        send_message(f"ℹ️ Stratégie {label} non active.", chat_id)
-        return
-    parts = text.strip().split()
-    if len(parts) < 2:
-        cmd = "/buyb" if strat == "b" else "/buy"
-        send_message(f"Usage : `{cmd} SYMBOL`\n⚠️ Tous les filtres seront ignorés.", chat_id)
-        return
-    symbol = parts[1].upper()
-    if "/" not in symbol:
-        symbol = symbol + "/USDC"
-    pending_confirmations[chat_id] = {
-        "action": "buy", "symbol": symbol, "strategy": strat
-    }
-    send_message(
-        f"⚠️ *Confirmation achat forcé [{label}]*\n\n"
-        f"Entrée manuelle sur `{symbol}` ?\n"
-        f"_Tous les filtres seront ignorés. SL/TS/TP normaux appliqués._\n\n"
-        f"Réponds *OUI* pour confirmer ou *NON* pour annuler.",
-        chat_id,
-    )
+    # --- execution (paper) ------------------------------------------------
+    def open_position(self, sig):
+        self.positions.append({
+            "symbol": sig.symbol, "tag": sig.tag, "entry_price": sig.price,
+            "size": sig.size, "init_stop": sig.stop, "stop": sig.stop,
+            "target": sig.target, "highest": sig.price, "stage": "3xATR",
+            "opened_at": dt.datetime.utcnow().isoformat(),
+        })
+        self.alerts.emit(sig)
 
+    def close_position(self, pos, sig):
+        cost = pos["entry_price"] * pos["size"] * C.ROUND_TRIP_COST
+        sig.pnl_usdc -= cost
+        self.trades.append({"tag": pos["tag"], "r_multiple": sig.r_multiple,
+                            "pnl_usdc": sig.pnl_usdc, "closed_at": dt.date.today().isoformat()})
+        self.positions.remove(pos)
+        self.alerts.emit(sig)
 
-# ── Skip (/skip / /skipb) ─────────────────────────────────────────────────────
-def handle_skip(text: str, chat_id: str, strat: str = "a"):
-    strat_obj = strategy if strat == "a" else strategy_b
-    label     = "A" if strat == "a" else "B"
-    if not strat_obj:
-        send_message(f"ℹ️ Stratégie {label} non active.", chat_id)
-        return
-    parts = text.strip().split()
-    if len(parts) < 2:
-        cmd = "/skipb" if strat == "b" else "/skip"
-        send_message(f"Usage : `{cmd} SYMBOL`", chat_id)
-        return
-    symbol = parts[1].upper()
-    if "/" not in symbol:
-        symbol = symbol + "/USDC"
-    send_message(strat_obj.skip_symbol(symbol), chat_id)
-
-
-# ── Actions boutons / commandes ───────────────────────────────────────────────
-def handle_action(action: str, chat_id: str, raw_text: str = ""):
-    global bot_running, bot_paused, strategy, strategy_b
-    global _trading_thread, _trading_thread_b
-
-    # ── Debug ─────────────────────────────────────────────────────────────────
-    if action in ("debug", "debug_b"):
-        strat     = "b" if action == "debug_b" else "a"
-        strat_obj = strategy if strat == "a" else strategy_b
-        if not strat_obj:
-            send_message("ℹ️ Stratégie non active.", chat_id)
-            return
-        parts = raw_text.strip().split()
-        if len(parts) < 2:
-            send_message(f"Usage : `/debug{'b' if strat == 'b' else ''} SYMBOL`", chat_id)
-            return
-        symbol = parts[1].upper()
+    def force_buy(self, raw_symbol: str):
+        """Achat forcé manuel. Géré comme un breakout (trailing 3 étages).
+        Outrepasse le régime, le scan et la pause ; respecte le plafond de
+        positions, 1 position/paire et le risque 1 %."""
+        symbol = raw_symbol.upper()
         if "/" not in symbol:
-            symbol = symbol + "/USDC"
-        send_message(strat_obj.debug_position(symbol), chat_id)
-        return
-
-    if action == "debug_prompt":
-        if not strategy:
-            send_message("ℹ️ Aucune stratégie active.", chat_id)
+            symbol += "/" + C.QUOTE
+        if any(p["symbol"] == symbol for p in self.positions):
+            self.alerts.info(f"Position déjà ouverte sur {symbol}.")
             return
-        positions = strategy.get_positions()
-        if not positions:
-            send_message("📭 Aucune position A à diagnostiquer.", chat_id)
+        if len(self.positions) >= C.MAX_POSITIONS:
+            self.alerts.info(f"Plafond de {C.MAX_POSITIONS} positions atteint — achat refusé.")
             return
-        symbols = "\n".join([f"• `{p['symbol']}`" for p in positions])
-        waiting_input[chat_id] = {"waiting": "debug", "strategy": "a"}
-        send_message(
-            f"🔍 *Debug A — quelle paire ?*\n\nPositions :\n{symbols}\n\n"
-            f"Envoie le symbole (ex: `ETH` ou `ETH/USDC`)",
-            chat_id,
-        )
-        return
-
-    if action == "close_prompt":
-        if not strategy:
-            send_message("ℹ️ Aucune stratégie active.", chat_id)
+        df = fetch_df(self.exchange, symbol, C.TIMEFRAME, C.CANDLE_LIMIT)
+        if df is None or len(df) < C.BRK_ATR_PERIOD + 2:
+            self.alerts.error(f"Achat forcé {symbol} : paire ou données indisponibles.")
             return
-        positions = strategy.get_positions()
-        if not positions:
-            send_message("📭 Aucune position A à fermer.", chat_id)
+        a = ind.atr(df, C.BRK_ATR_PERIOD).iloc[-1]
+        price = float(df["close"].iloc[-1])
+        stop = price - C.BRK_STOP_ATR_MULT * a
+        size = BaseStrategy.position_size(C.CAPITAL_USDC, C.RISK_PER_TRADE, price, stop)
+        if size <= 0 or a != a:
+            self.alerts.error(f"Achat forcé {symbol} : dimensionnement impossible.")
             return
-        symbols = "\n".join([
-            f"• `{p['symbol']}` | G/P : `{p['pnl_pct']:+.2f}%`"
-            for p in positions
-        ])
-        waiting_input[chat_id] = {"waiting": "close", "strategy": "a"}
-        send_message(
-            f"❌ *Fermer A — quelle paire ?*\n\nPositions :\n{symbols}\n\n"
-            f"Envoie le symbole (ex: `ETH` ou `ETH/USDC`)",
-            chat_id,
-        )
-        return
+        if symbol not in self.universe:      # pour que les cycles suivants le gèrent
+            self.universe.append(symbol)
+        self.open_position(Signal(
+            type=SignalType.ENTRY, tag="BRK", symbol=symbol, price=price,
+            stop=stop, size=size, target=None,
+            reason="achat forcé manuel (géré comme breakout : trailing 3 étages)"))
 
-    if action == "closeall_prompt":
-        handle_close("/closeall", chat_id, "a")
-        return
+    def daily_pnl(self, tag=None):
+        today = dt.date.today().isoformat()
+        return sum(t["pnl_usdc"] for t in self.trades
+                   if t["closed_at"] == today and (tag is None or t["tag"] == tag))
 
-    # ── Start ─────────────────────────────────────────────────────────────────
-    if action == "start":
-        if bot_running and not bot_paused:
-            send_message("⚠️ Le bot tourne déjà.", chat_id)
+    def total_pnl(self, tag=None):
+        return sum(t["pnl_usdc"] for t in self.trades if tag is None or t["tag"] == tag)
+
+    # --- cycle ------------------------------------------------------------
+    def cycle(self):
+        now = local_now()
+        if self._uni_day != now.date() and now.hour >= C.UNIVERSE_REFRESH_HOUR:
+            self.refresh_universe()
+
+        btc_htf = fetch_df(self.exchange, "BTC/USDC", C.HTF, C.CANDLE_LIMIT)
+        self.btc_ok = R.btc_bullish(btc_htf)
+        self._detect_btc_flip()
+
+        self.market = {s: fetch_df(self.exchange, s, C.TIMEFRAME, C.CANDLE_LIMIT)
+                       for s in self.universe}
+
+        # 1) SORTIES d'abord (libere des places)
+        for strat in self.strategies.values():
+            for sig in strat.check_exits(list(self.positions), self.market):
+                pos = next((p for p in self.positions
+                            if p["symbol"] == sig.symbol and p["tag"] == sig.tag), None)
+                if pos:
+                    self.close_position(pos, sig)
+
+        # 2) ENTREES (garde-fous : pause, coupe-circuit, plafond, 1 pos/paire)
+        if not self.paused and self.daily_pnl() > -C.DAILY_CIRCUIT_BREAKER * C.CAPITAL_USDC:
+            held = {p["symbol"] for p in self.positions}
+            for sym in self.universe:
+                if sym in held or len(self.positions) >= C.MAX_POSITIONS:
+                    continue
+                tag = R.allowed_tag(R.detect_regime(self.market.get(sym)), self.btc_ok)
+                strat = self.strategies.get(tag)
+                if not strat:
+                    continue
+                for sig in strat.scan({sym: self.market.get(sym)}):
+                    if len(self.positions) >= C.MAX_POSITIONS:
+                        break
+                    if sig.symbol not in {p["symbol"] for p in self.positions}:
+                        self.open_position(sig)
+                strat.force_scan = False
+
+        _save(C.POSITIONS_FILE, self.positions)
+        _save(C.TRADES_FILE, self.trades)
+        self._scheduled_recap(now)
+
+    def _detect_btc_flip(self):
+        if self._btc_state is None:
+            self._btc_state = self.btc_ok
             return
-        if bot_paused:
-            bot_paused = False
-            send_message("▶️ *Bot repris.*", chat_id)
-            return
-        # Vérification thread A
-        if _trading_thread and _trading_thread.is_alive():
-            _trading_thread.join(timeout=5)
-            if _trading_thread.is_alive():
-                send_message("⚠️ Thread A précédent encore actif. Attends 5s.", chat_id)
-                return
-        # Vérification thread B
-        if _trading_thread_b and _trading_thread_b.is_alive():
-            _trading_thread_b.join(timeout=5)
-
-        bot_running = True
-        bot_paused  = False
-        strategy    = TradingStrategy(binance_key=BINANCE_KEY, binance_secret=BINANCE_SECRET)
-        strategy_b  = StrategyB(binance_key=BINANCE_KEY, binance_secret=BINANCE_SECRET)
-        nb_a        = len(strategy.positions)
-        nb_b        = len(strategy_b.positions)
-
-        _trading_thread   = threading.Thread(target=trading_loop,   daemon=True)
-        _trading_thread_b = threading.Thread(target=trading_loop_b, daemon=True)
-        _trading_thread.start()
-        _trading_thread_b.start()
-
-        recap_a = f"\n📂 {nb_a} position(s) A rechargée(s)." if nb_a > 0 else ""
-        recap_b = f"\n📂 {nb_b} position(s) B rechargée(s)." if nb_b > 0 else ""
-        send_message(
-            f"✅ *Bot démarré* — Mode PAPER — 2 stratégies actives\n\n"
-            f"*Stratégie A — Trend Following*\n"
-            f"💰 100 USDC | 5 positions max\n"
-            f"📐 SL ×2.5 ATR | TS adaptatif ×2.0–×3.5\n"
-            f"🎯 TP1 +3×ATR (25%) | TP2 +5×ATR (25%) | Reste 50% TS\n"
-            f"🔍 Liquidité 10M | EMA | RSI 45–85 | BTC bear mode{recap_a}\n\n"
-            f"*Stratégie B — Momentum Breakout*\n"
-            f"💰 100 USDC | 5 positions max\n"
-            f"📐 SL ×1.5 ATR | TS ×1.5 ATR (serré)\n"
-            f"🎯 TP1 +6% (40%) | TP2 +12% (40%) | Reste 20% TS\n"
-            f"🔍 Liquidité 1M | Volume ×3 | RSI 60–75 | Momentum +5%/1h{recap_b}",
-            chat_id,
-        )
-        return
-
-    # ── Pause ─────────────────────────────────────────────────────────────────
-    elif action == "pause":
-        if not bot_running:
-            send_message("ℹ️ Le bot n'est pas démarré.", chat_id)
-            return
-        if bot_paused:
-            send_message("ℹ️ Déjà en pause.", chat_id)
-            return
-        bot_paused = True
-        send_message("⏸ *Pause* — stops et TP toujours actifs (A et B).", chat_id)
-
-    # ── Stop ──────────────────────────────────────────────────────────────────
-    elif action == "stop":
-        if not bot_running:
-            send_message("ℹ️ Le bot n'est pas en cours d'exécution.", chat_id)
-            return
-        bot_running = False
-        bot_paused  = False
-        if _trading_thread and _trading_thread.is_alive():
-            _trading_thread.join(timeout=10)
-        if _trading_thread_b and _trading_thread_b.is_alive():
-            _trading_thread_b.join(timeout=10)
-        send_message("⏹ *Bot arrêté.* Positions A et B sauvegardées.", chat_id)
-
-    elif action == "status":
-        send_message(build_status(), chat_id)
-
-    elif action == "positions":
-        send_message(build_trades(), chat_id)
-
-    elif action == "stats":
-        send_message(build_stats(), chat_id)
-
-    elif action == "stats_b":
-        send_message(build_stats_b(), chat_id)
-
-    # ── Boost A ───────────────────────────────────────────────────────────────
-    elif action == "boost":
-        global force_scan
-        if not bot_running:
-            send_message("ℹ️ Le bot n'est pas démarré.", chat_id)
-            return
-        force_scan = True
-        send_message("⚡ *[A] Scan forcé déclenché.*", chat_id)
-        if strategy:
-            summary = strategy.scan_market_summary(force=True)
-            if summary:
-                send_message(summary, chat_id)
-
-    # ── Boost B ───────────────────────────────────────────────────────────────
-    elif action == "boost_b":
-        global force_scan_b
-        if not bot_running:
-            send_message("ℹ️ Le bot n'est pas démarré.", chat_id)
-            return
-        force_scan_b = True
-        send_message("⚡ *[B] Scan forcé déclenché.*", chat_id)
-        if strategy_b:
-            summary = strategy_b.scan_market_summary(force=True)
-            if summary:
-                send_message(summary, chat_id)
-
-    elif action == "help":
-        send_message(
-            "⚙️ *Aide — Bot 2 Stratégies*\n\n"
-            "▶️ Démarrer — Lance A et B simultanément\n"
-            "⏸ Pause — Suspend les deux _(stops et TP actifs)_\n"
-            "⏹ Arrêter — Arrêt complet\n"
-            "📊 Statut — Vue combinée A + B\n"
-            "📋 Trades — Toutes les positions ouvertes\n"
-            "📈 Stats — Statistiques détaillées A\n"
-            "⚡ Boost — Scan immédiat A\n\n"
-            "*Stratégie A — Trend Following :*\n"
-            "`/debug SYMBOL` — Diagnostiquer une position A\n"
-            "`/close SYMBOL` — Fermer une position A\n"
-            "`/closeall` — Fermer toutes les positions A\n"
-            "`/buy SYMBOL` — Entrée forcée A ⚠️\n"
-            "`/skip SYMBOL` — Blacklister 24h (A)\n"
-            "`/stats` — Stats A détaillées\n"
-            "`/boost` — Scan immédiat A\n\n"
-            "*Stratégie B — Momentum Breakout :*\n"
-            "`/debugb SYMBOL` — Diagnostiquer une position B\n"
-            "`/closeb SYMBOL` — Fermer une position B\n"
-            "`/closeallb` — Fermer toutes les positions B\n"
-            "`/buyb SYMBOL` — Entrée forcée B ⚠️\n"
-            "`/skipb SYMBOL` — Blacklister 24h (B)\n"
-            "`/statsb` — Stats B détaillées\n"
-            "`/boostb` — Scan immédiat B\n\n"
-            "_A : EMA20>50 | Volume ×2 | RSI 45–85 | 10M liquidité_\n"
-            "_B : Momentum +5%/1h | Volume ×3 spike | RSI 60–75 | 1M liquidité_",
-            chat_id,
-        )
-
-
-# ── Boucle de trading A ───────────────────────────────────────────────────────
-def trading_loop():
-    global force_scan, last_morning_hour
-    log.info("[A] Boucle démarrée")
-    while bot_running:
-        try:
-            check_midnight_reset()
-
-            now_paris = datetime.now(PARIS_TZ)
-            if now_paris.hour == MORNING_HOUR and now_paris.hour != last_morning_hour and strategy:
-                last_morning_hour = now_paris.hour
-                for msg in strategy.morning_analysis():
-                    send_message(msg)
-
-            if force_scan:
-                force_scan = False
-                log.info("[A] Scan forcé via /boost")
-
-            alerts = strategy.scan()
-            for alert in alerts:
-                send_message(alert)
-
-            positions = strategy.get_positions() if strategy else []
-            if positions:
-                if should_send_recap():
-                    recap = build_recap()
-                    if recap:
-                        send_message(recap)
+        if self.btc_ok != self._btc_state:
+            self._btc_state = self.btc_ok
+            if self.btc_ok:
+                self.alerts.regime_change("BTC repasse au-dessus EMA200 (4h) · breakout réactivé")
             else:
-                if should_send_diagnostic() and strategy:
-                    msg = strategy.scan_market_summary()
-                    if msg:
-                        send_message(msg)
+                self.alerts.regime_change("BTC repasse sous EMA200 (4h) · breakout suspendu, seul MR actif")
 
+    # --- vues -------------------------------------------------------------
+    def build_snapshot(self):
+        strat_rows = []
+        for tag, s in self.strategies.items():
+            strat_rows.append({"tag": tag, "label": s.label,
+                               "capital": C.CAPITAL_USDC + self.total_pnl(tag),
+                               "pnl_today": self.daily_pnl(tag), "pnl_total": self.total_pnl(tag)})
+        positions = []
+        for p in self.positions:
+            cur = self._current_price(p["symbol"], p["entry_price"])
+            pnl_usdc = (cur - p["entry_price"]) * p["size"]
+            r_unit = p["entry_price"] - p["init_stop"]
+            positions.append({
+                "tag": p["tag"], "symbol": p["symbol"],
+                "pnl_usdc": pnl_usdc, "pnl_pct": (cur / p["entry_price"] - 1) * 100,
+                "entry": p["entry_price"], "current": cur, "stop": p["stop"],
+                "target": p.get("target"), "stage": p.get("stage"),
+                "r_now": (cur - p["entry_price"]) / r_unit if r_unit > 0 else 0.0,
+            })
+        scan = []
+        for sym in self.universe[:8]:
+            reg = R.detect_regime(self.market.get(sym))
+            note = {"TREND": "surveillé (breakout)", "RANGE": "surveillé (mean rev.)",
+                    "NONE": "zone morte"}[reg]
+            scan.append({"symbol": sym, "regime": reg, "note": note})
+        return {
+            "time": local_now().strftime("%d/%m %H:%M"),
+            "strategies": strat_rows,
+            "total_capital": C.CAPITAL_USDC * len(strat_rows) + self.total_pnl(),
+            "total_pnl_today": self.daily_pnl(),
+            "positions": positions, "max_positions": C.MAX_POSITIONS,
+            "btc_bullish": self.btc_ok, "scan": scan,
+        }
+
+    def _current_price(self, symbol, fallback):
+        df = self.market.get(symbol)
+        if df is not None and len(df):
+            return float(df["close"].iloc[-1])
+        return fallback
+
+    def _scheduled_recap(self, now):
+        key = (now.date(), now.hour)
+        if now.hour in C.RECAP_HOURS and key not in self._fired:
+            self._fired.add(key)
+            self.alerts.recap(self.build_snapshot(), on_demand=False)
+
+    # --- commandes Telegram -----------------------------------------------
+    def poll_commands(self):
+        if not self.alerts.enabled:
+            return
+        import urllib.request
+        try:
+            url = f"https://api.telegram.org/bot{self.alerts.token}/getUpdates?timeout=0"
+            if self._tg_offset is not None:
+                url += f"&offset={self._tg_offset}"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                for upd in json.loads(r.read()).get("result", []):
+                    self._tg_offset = upd["update_id"] + 1
+                    text = (upd.get("message", {}) or {}).get("text", "").strip().lower()
+                    if text.startswith("/buy"):
+                        parts = text.split()
+                        if len(parts) >= 2:
+                            self.force_buy(parts[1])
+                        else:
+                            self.alerts.info("Usage : /buy <paire>  (ex. /buy sol)")
+                        continue
+                    self.handle(BUTTON_MAP.get(text))
         except Exception as e:
-            log.error(f"[A] Erreur boucle : {e}")
-            send_message(f"⚠️ [A] Erreur : `{e}`")
+            print(f"[tg] poll: {e}")
 
-        for _ in range(60):
-            if force_scan or not bot_running:
-                break
+    def handle(self, action):
+        if action == "status":
+            self.alerts.recap(self.build_snapshot(), on_demand=True)
+        elif action == "positions":
+            snap = self.build_snapshot()
+            self.alerts.positions_detail(snap["positions"])
+        elif action == "perf":
+            self.alerts.perf(compute_metrics(self.trades, self.strategies))
+        elif action == "regime":
+            self.alerts.recap(self.build_snapshot(), on_demand=True)
+        elif action == "boost":
+            for s in self.strategies.values():
+                s.force_scan = True
+            self.alerts.info("Boost : scan forcé au prochain cycle.")
+        elif action == "pause":
+            self.paused = True
+            self.alerts.info("⏸ En pause — plus d'ouverture. Les positions restent gérées.")
+        elif action == "start":
+            self.paused = False
+            self.alerts.info("▶️ Actif.")
+        elif action == "closeall":
+            n = len(self.positions)
+            for p in list(self.positions):
+                cur = self._current_price(p["symbol"], p["entry_price"])
+                sig = self.strategies[p["tag"]].build_exit(p, cur, "fermeture manuelle")
+                self.close_position(p, sig)
+            self.alerts.info(f"💣 {n} position(s) fermée(s).")
+        elif action == "help":
+            self.alerts.info("Statut/Positions/Perf = vues. Boost = force le scan. "
+                             "Pause = stoppe les ouvertures (positions toujours gérées). "
+                             "Tout fermer = clôture tout. /buy <paire> = achat forcé manuel.")
+
+    # --- boucle -----------------------------------------------------------
+    def run(self):
+        self.refresh_universe()
+        self.alerts.startup([s.label for s in self.strategies.values()], len(self.universe))
+        last = 0.0
+        while True:
+            self.poll_commands()
+            if time.time() - last >= C.SCAN_INTERVAL_SEC:
+                try:
+                    self.cycle()
+                except Exception as e:
+                    self.alerts.error(f"Cycle : {e}")
+                last = time.time()
             time.sleep(1)
 
-    log.info("[A] Boucle arrêtée")
 
-
-# ── Boucle de trading B ───────────────────────────────────────────────────────
-def trading_loop_b():
-    global force_scan_b, last_morning_hour_b
-    log.info("[B] Boucle démarrée")
-    # Décalage de 30s pour éviter que A et B appellent l'API exactement en même temps
-    time.sleep(30)
-    while bot_running:
-        try:
-            now_paris = datetime.now(PARIS_TZ)
-            if now_paris.hour == MORNING_HOUR and now_paris.hour != last_morning_hour_b and strategy_b:
-                last_morning_hour_b = now_paris.hour
-                for msg in strategy_b.morning_analysis():
-                    send_message(msg)
-
-            if force_scan_b:
-                force_scan_b = False
-                log.info("[B] Scan forcé via /boostb")
-
-            alerts = strategy_b.scan()
-            for alert in alerts:
-                send_message(alert)
-
-            positions_b = strategy_b.get_positions() if strategy_b else []
-            if positions_b:
-                if should_send_recap_b():
-                    recap = build_recap_b()
-                    if recap:
-                        send_message(recap)
-            else:
-                if should_send_diagnostic_b() and strategy_b:
-                    msg = strategy_b.scan_market_summary()
-                    if msg:
-                        send_message(msg)
-
-        except Exception as e:
-            log.error(f"[B] Erreur boucle : {e}")
-            send_message(f"⚠️ [B] Erreur : `{e}`")
-
-        for _ in range(60):
-            if force_scan_b or not bot_running:
-                break
-            time.sleep(1)
-
-    log.info("[B] Boucle arrêtée")
-
-
-# ── Boucle Telegram (long polling) ───────────────────────────────────────────
-def telegram_loop():
-    global last_update_id
-    log.info("Écoute Telegram démarrée")
-    send_message("🤖 *Bot en ligne* — utilise les boutons ou ⚙️ Aide.")
-    while True:
-        updates = get_updates(offset=last_update_id + 1)
-        for update in updates:
-            last_update_id = update["update_id"]
-            msg     = update.get("message", {})
-            text    = msg.get("text", "").strip()
-            chat_id = str(msg.get("chat", {}).get("id", ""))
-            if not text:
-                continue
-
-            tl = text.lower()
-
-            # ── Commandes B ───────────────────────────────────────────────────
-            if tl.startswith("/debugb"):
-                handle_action("debug_b", chat_id, raw_text=text)
-                continue
-            if tl.startswith("/closeball"):
-                handle_close("/closeball", chat_id, "b")
-                continue
-            if tl.startswith("/closeb"):
-                handle_close(text, chat_id, "b")
-                continue
-            if tl.startswith("/buyb"):
-                handle_buy(text, chat_id, "b")
-                continue
-            if tl.startswith("/skipb"):
-                handle_skip(text, chat_id, "b")
-                continue
-
-            # ── Commandes A ───────────────────────────────────────────────────
-            if tl.startswith("/debug"):
-                handle_action("debug", chat_id, raw_text=text)
-                continue
-            if tl.startswith("/closeall"):
-                handle_close("/closeall", chat_id, "a")
-                continue
-            if tl.startswith("/close"):
-                handle_close(text, chat_id, "a")
-                continue
-            if tl.startswith("/buy"):
-                handle_buy(text, chat_id, "a")
-                continue
-            if tl.startswith("/skip"):
-                handle_skip(text, chat_id, "a")
-                continue
-
-            if chat_id in pending_confirmations:
-                handle_confirmation(text, chat_id)
-                continue
-
-            if chat_id in waiting_input:
-                handle_waiting_input(text, chat_id)
-                continue
-
-            action = BUTTON_MAP.get(tl)
-            if action:
-                handle_action(action, chat_id)
-            else:
-                send_message(
-                    f"❓ Non reconnu : `{text}`\nUtilise les boutons ou ⚙️ Aide.", chat_id
-                )
-
-        time.sleep(1)
-
-
-# ── Point d'entrée ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Démarrage")
-    telegram_loop()
+    Bot().run()
