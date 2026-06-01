@@ -152,9 +152,8 @@ class Bot:
     def refresh_universe(self):
         try:
             markets = self.exchange.load_markets()
-            cands = [s for s, m in markets.items()
-                     if m.get("spot") and m.get("active") and m.get("quote") == C.QUOTE]
-            tickers = self.exchange.fetch_tickers(cands)
+            # tous les tickers en un appel (pas de parametre 'symbols' -> evite l'erreur -1100)
+            tickers = self.exchange.fetch_tickers()
             self.universe = filter_universe(markets, tickers, {p["symbol"] for p in self.positions})
             self._uni_day = local_now().date()
             print(f"[univers] {len(self.universe)} paires >= {C.MIN_QUOTE_VOLUME_24H/1e6:g}M USDC")
